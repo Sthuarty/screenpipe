@@ -713,6 +713,7 @@ async fn build_models_json(
         let provider_name = match config.provider.as_str() {
             "openai" => "openai-byok",
             "openai-chatgpt" => "openai-chatgpt",
+            "github-copilot" => "github-copilot",
             "native-ollama" => "ollama",
             "anthropic" => "anthropic-byok",
             "custom" => "custom",
@@ -724,6 +725,16 @@ async fn build_models_json(
                 "http://localhost:11434/v1".to_string()
             } else if config.provider == "openai-chatgpt" {
                 "https://chatgpt.com/backend-api".to_string()
+            } else if config.provider == "github-copilot" {
+                // Local OpenAI-compatible proxy that injects Copilot session
+                // token + required editor headers and refreshes automatically.
+                match crate::github_copilot_proxy::ensure_started().await {
+                    Ok(info) => info.base_url,
+                    Err(e) => {
+                        warn!("github copilot proxy unavailable: {}", e);
+                        String::new()
+                    }
+                }
             } else if config.provider == "anthropic" && config.url.is_empty() {
                 "https://api.anthropic.com".to_string()
             } else if config.provider == "openai" && config.url.is_empty() {
@@ -742,6 +753,7 @@ async fn build_models_json(
                     "native-ollama" => "ollama".to_string(),
                     "openai" => "OPENAI_API_KEY".to_string(),
                     "openai-chatgpt" => "OPENAI_CHATGPT_TOKEN".to_string(),
+                    "github-copilot" => "GITHUB_COPILOT_PROXY_KEY".to_string(),
                     "anthropic" => "ANTHROPIC_API_KEY".to_string(),
                     "custom" => "CUSTOM_API_KEY".to_string(),
                     _ => "".to_string(),
@@ -1054,6 +1066,7 @@ pub async fn pi_start_inner(
             let provider_name = match config.provider.as_str() {
                 "openai" => "openai-byok",
                 "openai-chatgpt" => "openai-chatgpt",
+                "github-copilot" => "github-copilot",
                 "native-ollama" => "ollama",
                 "anthropic" => "anthropic-byok",
                 // "custom" requires a valid URL; fall back to screenpipe cloud if missing
@@ -1363,6 +1376,22 @@ pub async fn pi_start_inner(
                 Err(e) => {
                     return Err(format!(
                         "ChatGPT OAuth token unavailable: {}. Please sign in again.",
+                        e
+                    ));
+                }
+            }
+        }
+
+        // GitHub Copilot: inject the local proxy's api_key (proxy handles
+        // the actual Copilot session token + header refresh internally).
+        if config.provider == "github-copilot" {
+            match crate::github_copilot_proxy::ensure_started().await {
+                Ok(info) => {
+                    cmd.env("GITHUB_COPILOT_PROXY_KEY", info.api_key);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "GitHub Copilot proxy unavailable: {}. Please sign in again.",
                         e
                     ));
                 }
@@ -1824,6 +1853,7 @@ pub async fn pi_set_model(
     let pi_provider = match provider_config.provider.as_str() {
         "openai" => "openai-byok",
         "openai-chatgpt" => "openai-chatgpt",
+        "github-copilot" => "github-copilot",
         "native-ollama" => "ollama",
         "anthropic" => "anthropic-byok",
         "custom" if !provider_config.url.is_empty() => "custom",

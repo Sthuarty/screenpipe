@@ -498,6 +498,14 @@ async enableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async disableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("disable_keychain_encryption") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async openSearchWindow(query: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_search_window", { query }) };
@@ -930,6 +938,62 @@ async chatgptOauthModels() : Promise<Result<string[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async githubCopilotOauthStart() : Promise<Result<GithubCopilotDeviceCode, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_oauth_start") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async githubCopilotOauthStatus() : Promise<Result<GithubCopilotOAuthStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_oauth_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async githubCopilotOauthGetToken() : Promise<Result<GithubCopilotTokenInfo, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_oauth_get_token") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async githubCopilotOauthModels() : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_oauth_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async githubCopilotChatTest(model: string, body: JsonValue) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_chat_test", { model, body }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async githubCopilotOauthLogout() : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_oauth_logout") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async githubCopilotProxyInfo() : Promise<Result<ProxyInfo, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("github_copilot_proxy_info") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Start the OAuth flow for any integration that has `oauth_config()` set.
  * `integration_id` must match the integration's `def().id`.
@@ -1201,7 +1265,7 @@ async reencryptStore() : Promise<Result<null, string>> {
 /** user-defined types **/
 
 export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
-export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
+export type AIProviderType = "openai" | "openai-chatgpt" | "github-copilot" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
 export type BootPhaseSnapshot = { 
 /**
@@ -1256,6 +1320,10 @@ export type CalendarStatus = { available: boolean; authorized: boolean; authoriz
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
+export type GithubCopilotDeviceCode = { user_code: string; verification_uri: string; expires_in: bigint; interval: bigint }
+export type GithubCopilotOAuthStatus = { logged_in: boolean }
+export type GithubCopilotPollStatus = { kind: "pending" } | { kind: "success" } | { kind: "error"; message: string }
+export type GithubCopilotTokenInfo = { token: string; api_endpoint: string }
 export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; recommendedEngine: string; reason: string }
 export type IcsCalendarEntry = { name: string; url: string; enabled: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue }
@@ -1308,6 +1376,7 @@ maxTokens?: number;
  */
 systemPrompt?: string | null }
 export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
+export type ProxyInfo = { base_url: string; api_key: string }
 /**
  * A single schedule rule: a day-of-week + time range + what to record.
  */
