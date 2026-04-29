@@ -59,6 +59,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { AIPreset, commands } from "@/lib/utils/tauri";
 import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -172,6 +174,148 @@ function ChatGptSignInButton() {
       )}
       {loggedIn ? "signed in — sign out" : "sign in with chatgpt"}
     </Button>
+  );
+}
+
+function GitHubCopilotSignInButton() {
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [deviceCode, setDeviceCode] = useState<{
+    user_code: string;
+    verification_uri: string;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    commands.githubCopilotOauthStatus().then((res) => {
+      if (res.status === "ok") setLoggedIn(res.data.logged_in);
+    });
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    tauriListen<{ kind: "pending" | "success" | "error"; message?: string }>(
+      "github-copilot-oauth-status",
+      (event) => {
+        const payload = event.payload;
+        if (payload.kind === "success") {
+          setLoggedIn(true);
+          setLoading(false);
+          setDeviceCode(null);
+          setError(null);
+        } else if (payload.kind === "error") {
+          setLoading(false);
+          setDeviceCode(null);
+          setError(payload.message || "github authorization failed");
+        }
+      }
+    ).then((un) => {
+      unlisten = un;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  return (
+    <div className="space-y-2">
+      <Button
+        type="button"
+        variant={loggedIn ? "outline" : "default"}
+        disabled={loading}
+        className="h-7 text-xs w-full"
+        onClick={async () => {
+          if (loggedIn) {
+            setLoading(true);
+            await commands.githubCopilotOauthLogout();
+            setLoggedIn(false);
+            setLoading(false);
+            return;
+          }
+          setLoading(true);
+          setError(null);
+          const res = await commands.githubCopilotOauthStart();
+          if (res.status === "ok") {
+            setDeviceCode({
+              user_code: res.data.user_code,
+              verification_uri: res.data.verification_uri,
+            });
+            try {
+              await openUrl(res.data.verification_uri);
+            } catch (e) {
+              console.warn("failed to open verification url:", e);
+            }
+          } else {
+            setError(res.error || "failed to start device flow");
+            setLoading(false);
+          }
+        }}
+      >
+        {loading && !deviceCode ? (
+          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+        ) : loggedIn ? (
+          <Check className="h-3 w-3 mr-1 text-green-500" />
+        ) : (
+          <LogIn className="h-3 w-3 mr-1" />
+        )}
+        {loggedIn ? "signed in — sign out" : "sign in with github"}
+      </Button>
+      {deviceCode && !loggedIn && (
+        <div className="rounded-md border bg-muted/40 p-2 flex flex-col gap-1.5 text-[11px]">
+          <div className="flex items-center gap-1.5">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            waiting for github authorization…
+          </div>
+          <div>
+            1. open{" "}
+            <button
+              type="button"
+              className="underline underline-offset-2 hover:text-foreground"
+              onClick={() => openUrl(deviceCode.verification_uri)}
+            >
+              {deviceCode.verification_uri}
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            2. enter code:
+            <code className="px-1.5 py-0.5 rounded bg-background border font-mono tracking-widest">
+              {deviceCode.user_code}
+            </code>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-5 px-1.5 text-[10px]"
+              onClick={() =>
+                navigator.clipboard.writeText(deviceCode.user_code)
+              }
+            >
+              <Copy className="h-3 w-3 mr-1" /> copy
+            </Button>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-5 px-1.5 text-[10px] w-fit"
+            onClick={() => {
+              setDeviceCode(null);
+              setLoading(false);
+            }}
+          >
+            cancel
+          </Button>
+        </div>
+      )}
+      {error && (
+        <div className="text-[11px] text-destructive flex items-center gap-1.5">
+          <AlertTriangle className="h-3 w-3" /> {error}
+        </div>
+      )}
+      <p className="text-[10px] text-muted-foreground">
+        uses github&apos;s unofficial copilot api. requires copilot subscription.
+      </p>
+    </div>
   );
 }
 
@@ -376,6 +520,24 @@ export function AIProviderConfig({
         ]);
         setIsLoadingModels(false);
       })();
+    } else if (selectedProvider === "github-copilot") {
+      (async () => {
+        setIsLoadingModels(true);
+        try {
+          const res = await commands.githubCopilotOauthModels();
+          if (res.status === "ok") {
+            const uniq = Array.from(new Set(res.data));
+            setOpenAIModels(uniq.map((id) => ({ id })));
+          } else {
+            setOpenAIModels([]);
+          }
+        } catch (e) {
+          console.warn("[github-copilot] models fetch failed:", e);
+          setOpenAIModels([]);
+        } finally {
+          setIsLoadingModels(false);
+        }
+      })();
     }
   }, [selectedProvider, formData.apiKey, formData.url]);
 
@@ -423,7 +585,7 @@ export function AIProviderConfig({
             id="name"
             type="text"
             placeholder="enter preset name"
-            value={formData.id || undefined}
+            value={formData.id ?? ""}
             onChange={(e) => handleIdChange(e.target.value)}
             className={cn(
               "font-mono h-8 text-sm",
@@ -442,7 +604,7 @@ export function AIProviderConfig({
 
         <div className={cn(
           "grid gap-2",
-          piAvailable ? "grid-cols-3" : "grid-cols-4"
+          piAvailable ? "grid-cols-3" : "grid-cols-3"
         )}>
           {piAvailable && (
             <Button
@@ -538,6 +700,27 @@ export function AIProviderConfig({
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="/images/claude-ai.svg" alt="Claude API" className="h-3.5 w-3.5 rounded-sm" />
             <span>claude api</span>
+          </Button>
+
+          <Button
+            type="button"
+            variant={(selectedProvider as string) === "github-copilot" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+            onClick={() => {
+              if ((selectedProvider as string) !== "github-copilot") {
+                setSelectedProvider("github-copilot");
+                setFormData({
+                  ...formData,
+                  provider: "github-copilot",
+                  url: "",
+                  model: "gpt-4o",
+                });
+              }
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/images/github.png" alt="GitHub Copilot" className="h-3.5 w-3.5 rounded-sm" />
+            <span>github copilot</span>
           </Button>
         </div>
 
@@ -748,6 +931,45 @@ export function AIProviderConfig({
                   ))}
                 </datalist>
               )}
+            </div>
+          </div>
+        )}
+
+        {selectedProvider === "github-copilot" && (
+          <div className="space-y-1">
+            <div className="space-y-1">
+              <Label className="text-xs">github account</Label>
+              <GitHubCopilotSignInButton />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="model" className="text-xs">model</Label>
+              <Select
+                value={formData.model}
+                onValueChange={(value) =>
+                  setFormData({ ...formData, model: value })
+                }
+              >
+                <SelectTrigger className="h-8 text-sm">
+                  <SelectValue
+                    placeholder={
+                      isLoadingModels ? "loading models..." : "select model"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {openaiModels.length > 0 ? (
+                    openaiModels.map((model) => (
+                      <SelectItem key={model.id} value={model.id}>
+                        {model.id}
+                      </SelectItem>
+                    ))
+                  ) : (
+                    <SelectItem value="no-models" disabled>
+                      {isLoadingModels ? "loading..." : "sign in to load models"}
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
             </div>
           </div>
         )}
