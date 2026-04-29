@@ -656,7 +656,7 @@ const AISection = ({
 
       const chatStart = performance.now();
       const body = buildChatTestBody(settingsPreset?.model || "gpt-4o", "say hi", 50, "max_tokens");
-      const chatRes = await commands.githubCopilotChatTest(settingsPreset?.model || "gpt-4o", body);
+      const chatRes = await commands.githubCopilotChatTest(settingsPreset?.model || "gpt-4o", body as any);
       const latencyMs = Math.round(performance.now() - chatStart);
       if (abort.signal.aborted) return;
       if (chatRes.status !== "ok") {
@@ -667,7 +667,7 @@ const AISection = ({
         setTestStatus("done");
         return;
       }
-      const reply: string = chatRes.data?.choices?.[0]?.message?.content?.toString().slice(0, 100) || "No response";
+      const reply: string = (chatRes.data as any)?.choices?.[0]?.message?.content?.toString().slice(0, 100) || "No response";
       setTestResults((prev) => ({
         ...prev,
         chat: { status: "pass", message: `OK (${latencyMs}ms): "${reply}"`, latencyMs },
