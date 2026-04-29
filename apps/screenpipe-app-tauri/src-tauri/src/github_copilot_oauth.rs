@@ -458,8 +458,12 @@ pub async fn github_copilot_oauth_models() -> Result<Vec<String>, String> {
     let models: Vec<String> = v["data"]
         .as_array()
         .map(|arr| {
+            // Copilot returns multiple entries per model id (different
+            // capability tiers / policies). Dedupe while preserving order.
+            let mut seen = std::collections::HashSet::new();
             arr.iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .filter(|id| seen.insert(id.clone()))
                 .collect()
         })
         .unwrap_or_default();

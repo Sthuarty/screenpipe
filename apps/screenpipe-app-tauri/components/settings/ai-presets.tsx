@@ -1128,8 +1128,12 @@ const AISection = ({
         case "github-copilot": {
           const res = await commands.githubCopilotOauthModels();
           if (res.status === "ok") {
+            // Copilot's /models can return duplicate ids (different policies /
+            // capability tiers under the same surface name). Dedupe so React
+            // keys stay unique.
+            const uniq = Array.from(new Set(res.data));
             setModels(
-              res.data.map((id) => ({ id, name: id, provider: "github-copilot" }))
+              uniq.map((id) => ({ id, name: id, provider: "github-copilot" }))
             );
           } else {
             console.warn("[github-copilot] models fetch failed:", res.error);
