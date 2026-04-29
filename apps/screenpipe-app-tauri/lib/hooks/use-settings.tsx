@@ -229,6 +229,9 @@ export type Settings = SettingsStore & {
 	localRetentionEnabled?: boolean;
 	/** Days to keep data locally before auto-deleting (default: 14) */
 	localRetentionDays?: number;
+	/** What gets deleted past the cutoff: "media" keeps DB rows (search/timeline still
+	 * work), only reclaims mp4/wav/jpeg files. "all" wipes everything. Default: "media". */
+	localRetentionMode?: "media" | "all";
 	/** Apply macOS vibrancy effect to sidebar for a translucent glass look */
 	translucentSidebar?: boolean;
 	/** Notification preferences — which notification sources are enabled */
@@ -327,24 +330,43 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 const CHAT_PRESET_ID = "chat";
 const PIPES_PRESET_ID = "pipes";
 
+// Pro users get the chat / pipes pair (opus for interactive chat, auto for
+// pipe runs that pick the cheapest model that fits the task).
+// Non-pro users get a single "screenpipe" preset on auto — auto handles
+// model routing without needing the user to know what to pick.
+const SCREENPIPE_PRESET_ID = "screenpipe";
+
 export function makeDefaultPresets(isPro: boolean): AIPreset[] {
+	if (isPro) {
+		return [
+			{
+				id: CHAT_PRESET_ID,
+				provider: "screenpipe-cloud",
+				url: "",
+				model: "claude-opus-4-7",
+				maxContextChars: 200000,
+				defaultPreset: true,
+				prompt: "",
+			},
+			{
+				id: PIPES_PRESET_ID,
+				provider: "screenpipe-cloud",
+				url: "",
+				model: "auto",
+				maxContextChars: 200000,
+				defaultPreset: false,
+				prompt: "",
+			},
+		];
+	}
 	return [
 		{
-			id: CHAT_PRESET_ID,
+			id: SCREENPIPE_PRESET_ID,
 			provider: "screenpipe-cloud",
 			url: "",
-			model: isPro ? "claude-opus-4-7" : "claude-sonnet-4-5",
+			model: "auto",
 			maxContextChars: 200000,
 			defaultPreset: true,
-			prompt: "",
-		},
-		{
-			id: PIPES_PRESET_ID,
-			provider: "screenpipe-cloud",
-			url: "",
-			model: "claude-haiku-4-5",
-			maxContextChars: 200000,
-			defaultPreset: false,
 			prompt: "",
 		},
 	];
@@ -442,6 +464,7 @@ let DEFAULT_SETTINGS: Settings = {
 			appendTypedTextToMeetingNotes: true,
 			localRetentionEnabled: true,
 			localRetentionDays: 14,
+			localRetentionMode: "media",
 		};
 
 export function createDefaultSettingsObject(): Settings {
@@ -540,6 +563,25 @@ function createSettingsStore() {
 		if (!settings.aiPresets || settings.aiPresets.length === 0) {
 			const isPro = settings.user?.cloud_subscribed === true;
 			settings.aiPresets = makeDefaultPresets(isPro) as any;
+			needsUpdate = true;
+		}
+
+		// b2 seed: the first time we see a logged-in user, replace the anonymous
+		// "screenpipe" placeholder with the pro pair (chat + pipes) IF they're pro.
+		// Anonymous users keep the placeholder forever (which is correct — non-pro
+		// stays on the single "screenpipe" auto preset). Existing users with their
+		// own presets are untouched. Runs exactly once per install.
+		if (!(settings as any)._presetsSeededForUser && settings.user?.token) {
+			const isPro = settings.user?.cloud_subscribed === true;
+			const presets = settings.aiPresets ?? [];
+			const isAnonymousPlaceholder =
+				presets.length === 1 &&
+				(presets[0] as any)?.id === SCREENPIPE_PRESET_ID &&
+				(presets[0] as any)?.provider === "screenpipe-cloud";
+			if (isPro && isAnonymousPlaceholder) {
+				settings.aiPresets = makeDefaultPresets(true) as any;
+			}
+			(settings as any)._presetsSeededForUser = true;
 			needsUpdate = true;
 		}
 

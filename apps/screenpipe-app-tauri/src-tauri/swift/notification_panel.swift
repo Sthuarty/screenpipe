@@ -305,8 +305,20 @@ struct NotificationContentView: View {
         .shadow(color: .black.opacity(0.18), radius: 16, x: 0, y: 4)
         .shadow(color: .black.opacity(0.06), radius: 3, x: 0, y: 1)
         // Override link handling — SwiftUI's default openURL doesn't work
-        // in non-activating panels. Use NSWorkspace to open links directly.
+        // in non-activating panels. screenpipe:// URLs go through the
+        // action callback so they stay in-process (no macOS app activation
+        // bounce); everything else opens via NSWorkspace.
         .environment(\.openURL, OpenURLAction { url in
+            if url.scheme == "screenpipe" {
+                let urlStr = url.absoluteString
+                let escaped = urlStr.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                let json = "{\"type\":\"deeplink\",\"url\":\"\(escaped)\"}"
+                if let cb = gActionCallback {
+                    json.withCString { cb($0) }
+                    return .handled
+                }
+            }
             NSWorkspace.shared.open(url)
             return .handled
         })
@@ -345,10 +357,27 @@ struct MarkdownText: View {
         }
     }
 
-    /// A parsed inline segment
+    /// A parsed inline segment.
+    /// `viewerOverridePath` is set when the link is a `screenpipe://view?path=…`
+    /// deeplink (rewritten from a local file path by the /notify route). It
+    /// carries the original file path so the panel can render an ↗ button
+    /// next to the link to open the file in the OS default app — escape
+    /// hatch for users who want Xcode/Obsidian/Preview instead of the
+    /// in-app viewer.
     fileprivate enum Segment {
         case text(AttributedString)
-        case link(label: String, url: URL)
+        case link(label: String, url: URL, viewerOverridePath: String?)
+    }
+
+    /// If `url` is `screenpipe://view?path=…`, return the decoded path. Else nil.
+    fileprivate static func viewerOverridePath(for url: URL) -> String? {
+        guard url.scheme == "screenpipe" else { return nil }
+        let isView = url.host == "view"
+            || url.path == "view"
+            || url.path == "/view"
+        guard isView else { return nil }
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        return comps?.queryItems?.first(where: { $0.name == "path" })?.value
     }
 
     /// Parse a line into segments, separating links from other inline content
@@ -407,7 +436,8 @@ struct MarkdownText: View {
                             }
                             if let url = URL(string: urlStr.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlStr) ?? URL(string: urlStr) {
                                 flushText()
-                                segments.append(.link(label: linkText, url: url))
+                                let override = MarkdownText.viewerOverridePath(for: url)
+                                segments.append(.link(label: linkText, url: url, viewerOverridePath: override))
                                 remaining = urlPart[urlPart.index(after: closeParen)...]
                                 continue
                             }
@@ -445,8 +475,15 @@ struct MarkdownText: View {
                         Text(attr)
                             .lineSpacing(2)
                             .lineLimit(nil)
-                    case .link(let label, let url):
-                        LinkButton(label: label, url: url)
+                    case .link(let label, let url, let viewerOverridePath):
+                        if let override = viewerOverridePath {
+                            HStack(spacing: 4) {
+                                LinkButton(label: label, url: url)
+                                ViewerOverrideButton(path: override)
+                            }
+                        } else {
+                            LinkButton(label: label, url: url)
+                        }
                     }
                 }
             }
@@ -464,6 +501,58 @@ struct MarkdownText: View {
     }
 }
 
+/// Tiny ↗ button rendered next to a `screenpipe://view?path=…` link so the
+/// user can open the underlying file in the OS default app instead of the
+/// in-app viewer (e.g. Obsidian for `.md`, Preview for `.json`).
+@available(macOS 13.0, *)
+private struct ViewerOverrideButton: View {
+    let path: String
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: {
+            // Try Obsidian first for markdown — same logic as Rust's
+            // `open_note_path`. Falls through to NSWorkspace.open(URL).
+            let lower = path.lowercased()
+            if lower.hasSuffix(".md") || lower.hasSuffix(".markdown") {
+                if let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                   let obsidian = URL(string: "obsidian://open?path=\(encoded)") {
+                    if NSWorkspace.shared.open(obsidian) { return }
+                }
+            }
+            let fileUrl = URL(fileURLWithPath: path)
+            NSWorkspace.shared.open(fileUrl)
+        }) {
+            Text("↗")
+                .font(Brand.swiftUIMonoFont(size: 10))
+                .foregroundColor(isHovered ? .primary.opacity(0.9) : .primary.opacity(0.35))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .help("open in default app")
+        .onHover { h in
+            withAnimation(.linear(duration: Brand.animDuration)) { isHovered = h }
+        }
+    }
+}
+
+/// Open a URL with the right transport: in-app for screenpipe:// (no
+/// macOS activation bounce), NSWorkspace for everything else.
+@available(macOS 13.0, *)
+private func openLinkUrl(_ url: URL) {
+    if url.scheme == "screenpipe" {
+        let urlStr = url.absoluteString
+        let escaped = urlStr.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let json = "{\"type\":\"deeplink\",\"url\":\"\(escaped)\"}"
+        if let cb = gActionCallback {
+            json.withCString { cb($0) }
+            return
+        }
+    }
+    NSWorkspace.shared.open(url)
+}
+
 /// A clickable link rendered as a Button so it works in non-activating panels.
 /// SwiftUI Text with AttributedString links requires key focus to handle clicks,
 /// which non-activating panels don't provide. Button works without activation.
@@ -475,7 +564,7 @@ private struct LinkButton: View {
 
     var body: some View {
         Button(action: {
-            NSWorkspace.shared.open(url)
+            openLinkUrl(url)
         }) {
             Text(label)
                 .font(Brand.swiftUIMonoFont(size: 11))

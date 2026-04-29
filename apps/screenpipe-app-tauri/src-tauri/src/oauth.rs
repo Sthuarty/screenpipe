@@ -240,6 +240,27 @@ pub async fn oauth_connect(
         }
     }
 
+    // Jira: fetch the site cloud_id from /oauth/token/accessible-resources.
+    // The proxy base URL uses {cloud_id} as a placeholder resolved from the
+    // stored OAuth JSON — same pattern as QuickBooks' {realmId}.
+    if integration_id == "jira" {
+        if let Some(access_token) = token_data["access_token"].as_str() {
+            match fetch_jira_accessible_resources(&client, access_token).await {
+                Ok((cloud_id, site_name)) => {
+                    token_data["cloud_id"] = serde_json::Value::String(cloud_id);
+                    token_data["workspace_name"] = serde_json::Value::String(site_name);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Jira connected but failed to fetch site info: {}. \
+                         Ensure your Atlassian account has at least one Jira site and retry.",
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
     // Supabase: exchange the management OAuth token for project metadata used
     // by the existing proxy model (`project_url` + `service_key`).
     if integration_id == "supabase" {
@@ -546,6 +567,43 @@ async fn fetch_provider_identity(
         }
         _ => None,
     }
+}
+
+/// Fetch the Atlassian cloud site ID and name from the accessible-resources endpoint.
+///
+/// Atlassian OAuth tokens are tenant-agnostic — you must resolve the cloud_id
+/// from this endpoint before calling any Jira REST API. We pick the first site
+/// (most users have exactly one). The cloud_id is stored in the OAuth JSON so
+/// the proxy's {cloud_id} placeholder resolves automatically.
+async fn fetch_jira_accessible_resources(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<(String, String), String> {
+    let resources: serde_json::Value = client
+        .get("https://api.atlassian.com/oauth/token/accessible-resources")
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("accessible-resources request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("accessible-resources request rejected: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("invalid accessible-resources response: {e}"))?;
+
+    let first = resources
+        .as_array()
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| "no Jira sites found for this account".to_string())?;
+
+    let cloud_id = first["id"]
+        .as_str()
+        .ok_or_else(|| "site missing `id` field".to_string())?
+        .to_string();
+    let site_name = first["name"].as_str().unwrap_or(&cloud_id).to_string();
+
+    Ok((cloud_id, site_name))
 }
 
 /// Resolve Supabase project credentials from the OAuth management token.

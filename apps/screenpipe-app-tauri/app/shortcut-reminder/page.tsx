@@ -19,35 +19,70 @@ import { X, Phone } from "lucide-react";
 import { useOverlayData } from "./use-overlay-data";
 import { AudioEqualizer } from "./audio-equalizer";
 import { ScreenMatrix } from "./screen-matrix";
+import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
+import { appendAuthToken, ensureApiReady, getApiBaseUrl } from "@/lib/api";
 
 function useMeetingState() {
-  const [active, setActive] = useState(false);
+  const [meetingState, setMeetingState] = useState(() => computeMeetingActive(null, 0));
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    let abortCtrl: AbortController | null = null;
-    const check = () => {
-      abortCtrl?.abort();
-      abortCtrl = new AbortController();
-      localFetch("/meetings/status", { signal: abortCtrl.signal })
-        .then((r) => r.json())
-        .then((d) => setActive(!!d.active))
-        .catch(() => {});
+    let ws: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let backoffMs = 1000;
+
+    const connect = () => {
+      void (async () => {
+        try {
+          await ensureApiReady();
+          const wsBase = getApiBaseUrl().replace("http://", "ws://");
+          ws = new WebSocket(appendAuthToken(`${wsBase}/ws/meeting-status`));
+          ws.onopen = () => {
+            backoffMs = 1000;
+          };
+          ws.onmessage = (event) => {
+            try {
+              const parsed = JSON.parse(event.data) as MeetingStatusResponse;
+              setMeetingState(computeMeetingActive(parsed, 0));
+            } catch {
+              // ignore malformed payloads
+            }
+          };
+          ws.onclose = (event) => {
+            if (event.code === 1000) return;
+            retry = setTimeout(connect, backoffMs);
+            backoffMs = Math.min(backoffMs * 2, 10000);
+          };
+          ws.onerror = () => {
+            ws?.close();
+          };
+        } catch {
+          retry = setTimeout(connect, backoffMs);
+          backoffMs = Math.min(backoffMs * 2, 10000);
+        }
+      })();
     };
-    check();
-    const id = setInterval(check, 5000);
+
+    connect();
+
     return () => {
-      clearInterval(id);
-      abortCtrl?.abort();
+      if (retry) clearTimeout(retry);
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close(1000, "unmount");
+      }
     };
   }, []);
 
   const toggle = useCallback(async () => {
     setLoading(true);
     try {
-      if (active) {
-        await localFetch("/meetings/stop", { method: "POST" });
-        setActive(false);
+      if (meetingState.active) {
+        await localFetch("/meetings/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: meetingState.stoppableMeetingId }),
+        });
+        setMeetingState(computeMeetingActive(null, 0));
       } else {
         const res = await localFetch("/meetings/start", {
           method: "POST",
@@ -55,16 +90,21 @@ function useMeetingState() {
           body: JSON.stringify({ app: "manual" }),
         });
         if (res.ok) {
-          setActive(true);
+          setMeetingState(computeMeetingActive({
+            active: true,
+            manualActive: true,
+            meetingApp: "manual",
+            detectionSource: "manual",
+          }, Date.now()));
         }
       }
     } catch (e) {
       console.error("meeting toggle failed:", e);
     }
     setLoading(false);
-  }, [active]);
+  }, [meetingState]);
 
-  return { active, loading, toggle };
+  return { active: meetingState.active, loading, toggle };
 }
 
 export default function ShortcutReminderPage() {

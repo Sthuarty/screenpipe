@@ -77,6 +77,104 @@ const VERTEX_MAAS_MODELS: Record<string, { vertexId: string; region: string }> =
 	'qwen3-next-thinking': { vertexId: 'qwen/qwen3-next-80b-thinking-maas', region: 'global' },
 };
 
+/**
+ * Promote `reasoning_content` → `content` on a non-streaming response when
+ * `content` is empty. Some thinking models (Kimi K2 thinking, Qwen3 thinking)
+ * emit the entire answer in `reasoning_content` if `max_tokens` is exhausted
+ * before the model transitions out of its reasoning phase, leaving callers
+ * with a blank `content` field and an answer trapped behind a thinking marker.
+ */
+export function promoteReasoningToContent(result: any): void {
+	const choices = result?.choices;
+	if (!Array.isArray(choices)) return;
+	for (const choice of choices) {
+		const msg = choice?.message;
+		if (!msg) continue;
+		const content = typeof msg.content === 'string' ? msg.content : '';
+		const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : '';
+		if (content.length === 0 && reasoning.length > 0) {
+			msg.content = reasoning;
+		}
+	}
+}
+
+/**
+ * Streaming counterpart of `promoteReasoningToContent`. Buffers reasoning
+ * deltas and tracks whether any content delta was emitted; if the upstream
+ * stream ends (or hits `finish_reason`) without content, injects a synthetic
+ * content delta carrying the buffered reasoning so the client sees an answer.
+ *
+ * Reasoning deltas are still passed through unchanged — the duplication is
+ * acceptable; the alternative (buffering reasoning silently) breaks live
+ * thinking UI for normal cases.
+ */
+export function promoteReasoningStream(): TransformStream<Uint8Array, Uint8Array> {
+	const decoder = new TextDecoder();
+	const encoder = new TextEncoder();
+	let contentEmitted = false;
+	let reasoningBuffer = '';
+	let injected = false;
+	let partial = '';
+	let lastTemplate: any = null;
+
+	const buildInjection = (): string | null => {
+		if (injected || contentEmitted || !reasoningBuffer || !lastTemplate) return null;
+		injected = true;
+		const choice = lastTemplate.choices?.[0] ?? {};
+		const inject = {
+			...lastTemplate,
+			choices: [{ index: choice.index ?? 0, delta: { content: reasoningBuffer }, finish_reason: null }],
+		};
+		return `data: ${JSON.stringify(inject)}\n\n`;
+	};
+
+	return new TransformStream<Uint8Array, Uint8Array>({
+		transform(chunk, controller) {
+			const text = partial + decoder.decode(chunk, { stream: true });
+			const lines = text.split('\n');
+			partial = lines.pop() ?? '';
+
+			for (const line of lines) {
+				if (line.startsWith('data: ')) {
+					const data = line.slice(6).trim();
+					if (data === '[DONE]') {
+						const inj = buildInjection();
+						if (inj) controller.enqueue(encoder.encode(inj));
+						controller.enqueue(encoder.encode(line + '\n'));
+						continue;
+					}
+					try {
+						const parsed = JSON.parse(data);
+						lastTemplate = parsed;
+						const delta = parsed.choices?.[0]?.delta ?? {};
+						if (typeof delta.content === 'string' && delta.content.length > 0) {
+							contentEmitted = true;
+						}
+						if (typeof delta.reasoning_content === 'string') {
+							reasoningBuffer += delta.reasoning_content;
+						}
+						if (parsed.choices?.[0]?.finish_reason && !contentEmitted && !injected) {
+							const inj = buildInjection();
+							if (inj) controller.enqueue(encoder.encode(inj));
+						}
+					} catch {
+						// pass through unparseable lines untouched
+					}
+				}
+				controller.enqueue(encoder.encode(line + '\n'));
+			}
+		},
+		flush(controller) {
+			if (partial) controller.enqueue(encoder.encode(partial));
+			const inj = buildInjection();
+			if (inj) {
+				controller.enqueue(encoder.encode(inj));
+				controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+			}
+		},
+	});
+}
+
 export function isVertexMaasModel(model: string): boolean {
 	const lower = model.toLowerCase();
 	// Exact match first (e.g. "llama-4-maverick"), then substring for legacy names.
@@ -154,6 +252,7 @@ export class VertexMaasProvider implements AIProvider {
 		}
 
 		const result = await response.json();
+		promoteReasoningToContent(result);
 		return new Response(JSON.stringify(result), {
 			headers: { 'Content-Type': 'application/json' },
 		});
@@ -196,8 +295,11 @@ export class VertexMaasProvider implements AIProvider {
 			);
 		}
 
-		// The endpoint returns standard OpenAI SSE — pass through directly
-		return response.body!;
+		// Wrap SSE so that if upstream only fills `reasoning_content` (e.g. Kimi K2
+		// thinking running out of max_tokens before transitioning to content), we
+		// surface the reasoning as content. Otherwise Pi renders just an empty
+		// <details>Thinking</details> and the user thinks the model said nothing.
+		return response.body!.pipeThrough(promoteReasoningStream());
 	}
 
 	formatMessages(messages: Message[]): any[] {

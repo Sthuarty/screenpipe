@@ -175,6 +175,26 @@ export function DeeplinkHandler() {
         }
       }
 
+      // Handle in-app file viewer: screenpipe://view?path=<encoded-path>
+      // Notification bodies with markdown links to local files are rewritten
+      // to this scheme by the /notify route in src-tauri/src/notifications/rewrite.rs
+      if (parsedUrl.host === "view" || parsedUrl.pathname === "view") {
+        const filePath = parsedUrl.searchParams.get("path");
+        if (filePath) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("open_viewer_window", { path: filePath });
+          } catch (error) {
+            console.error("Failed to open viewer:", error);
+            toast({
+              title: "couldn't open file",
+              description: filePath,
+              variant: "destructive",
+            });
+          }
+        }
+      }
+
       // Handle frame deep links: screenpipe://frame/12345
       if (parsedUrl.pathname?.startsWith("/frame/") || parsedUrl.host === "frame") {
         const frameId = url.split("frame/")[1]?.replace(/^\//, "");

@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { ExternalLink, Loader2 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { localFetch } from "@/lib/api";
+import { toast } from "@/components/ui/use-toast";
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -130,7 +131,17 @@ export function UserBrowserCard() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => openUrl(CHROME_WEBSTORE_URL)}
+                onClick={async () => {
+                  try {
+                    await openUrl(CHROME_WEBSTORE_URL);
+                  } catch {
+                    try { await navigator.clipboard.writeText(CHROME_WEBSTORE_URL); } catch { /* clipboard may be denied */ }
+                    toast({
+                      title: "couldn't open your browser",
+                      description: `link copied — paste in Chrome: ${CHROME_WEBSTORE_URL}`,
+                    });
+                  }
+                }}
                 className="text-xs"
               >
                 <ExternalLink className="h-3 w-3 mr-1.5" />

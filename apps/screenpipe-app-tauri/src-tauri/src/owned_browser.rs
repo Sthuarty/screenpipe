@@ -142,33 +142,111 @@ impl OwnedWebviewHandle for TauriOwnedHandle {
 // Install — build the child webview, wire up the result listener, return handle
 // ---------------------------------------------------------------------------
 
-/// Wait for the main window to exist, then call [`install`]. The server
-/// thread can race window creation in `bun tauri dev`, so a single attempt
-/// often fails with "parent window 'main' not found"; retrying for a few
-/// seconds covers that gap without permanently giving up. After the wait
-/// budget the final error is returned and logged at the call site.
-pub async fn install_with_retry(
-    app: &AppHandle,
+/// Spawn the owned-browser install on a background task that survives
+/// tray-only mode. The previous fixed 30-attempt × 500ms loop (15s budget)
+/// failed silently when the user had the app running with the main window
+/// closed — by the time the budget expired, the agent permanently saw
+/// `ready=false` until the next recording restart.
+///
+/// New behavior: a fast retry loop covers the normal window-creation race
+/// (`bun tauri dev` server thread vs WebviewWindow creation), then the task
+/// switches into a passive watcher driven by the existing `window-focused`
+/// Tauri event and a 30-second fallback poll. As soon as the main window
+/// appears the install runs and attaches.
+pub fn spawn_install_when_ready(
+    app: AppHandle,
     screenpipe_dir: PathBuf,
-) -> Result<Arc<dyn OwnedWebviewHandle>, String> {
-    const MAX_ATTEMPTS: u32 = 30;
-    const BACKOFF: Duration = Duration::from_millis(500);
-    let mut last_err = String::from("not attempted");
-    for attempt in 1..=MAX_ATTEMPTS {
-        match install(app, screenpipe_dir.clone()).await {
-            Ok(handle) => return Ok(handle),
-            Err(e) => {
-                last_err = e;
-                tracing::debug!(
-                    "owned-browser install attempt {attempt}/{MAX_ATTEMPTS} failed: {last_err}"
-                );
-                tokio::time::sleep(BACKOFF).await;
+    owned_browser: std::sync::Arc<screenpipe_connect::connections::browser::OwnedBrowser>,
+) {
+    tauri::async_runtime::spawn(async move {
+        // Phase 1 — fast retry for the dev-server race where the main window
+        // is in the process of being created at the same moment recording
+        // starts. Same budget as before (15s) — most installs land here.
+        const FAST_ATTEMPTS: u32 = 30;
+        const FAST_BACKOFF: Duration = Duration::from_millis(500);
+        let mut last_err = String::new();
+        for attempt in 1..=FAST_ATTEMPTS {
+            match install(&app, screenpipe_dir.clone()).await {
+                Ok(handle) => {
+                    owned_browser.attach(handle).await;
+                    info!("owned-browser ready");
+                    return;
+                }
+                Err(e) => {
+                    last_err = e;
+                    tracing::debug!(
+                        "owned-browser install attempt {attempt}/{FAST_ATTEMPTS}: {last_err}"
+                    );
+                    tokio::time::sleep(FAST_BACKOFF).await;
+                }
             }
         }
-    }
-    Err(format!(
-        "owned-browser install gave up after {MAX_ATTEMPTS} attempts: {last_err}"
-    ))
+
+        // Phase 2 — main window probably closed/hidden (app in tray-only
+        // mode). Don't give up. Listen for the existing `window-focused`
+        // event (emitted by `show_main_window`) and retry on each kick;
+        // poll every 30s as a fallback in case the event is missed.
+        info!(
+            "owned-browser: main window not present after {FAST_ATTEMPTS} attempts \
+            ({last_err}) — switching to event-driven retry"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(8);
+        let _listener_id = app.listen("window-focused", move |_event| {
+            // Use try_send so we don't backpressure on the listener thread.
+            let _ = tx.try_send(());
+        });
+
+        // Cap total wait at 30 minutes per recording session — beyond that
+        // the user almost certainly isn't going to open the window, and we
+        // don't want a leaked task hanging around forever. The next
+        // recording restart will spawn a fresh attempt.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30 * 60);
+        let mut last_log = std::time::Instant::now();
+        loop {
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "owned-browser install gave up after 30 minutes of waiting \
+                    for the main window — agent will see ready=false until next \
+                    recording restart"
+                );
+                return;
+            }
+            tokio::select! {
+                _ = rx.recv() => {
+                    // Window-focused fired — try install on the next tick to
+                    // give the WebviewWindow a moment to settle.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    // Fallback poll. No log on this branch — it fires twice
+                    // a minute and would be noise.
+                }
+            }
+            if app.get_webview_window(PARENT_WINDOW_LABEL).is_none() {
+                // Main window still doesn't exist; loop and wait for the
+                // next event/poll.
+                if last_log.elapsed() > Duration::from_secs(300) {
+                    tracing::debug!("owned-browser: still waiting for main window");
+                    last_log = std::time::Instant::now();
+                }
+                continue;
+            }
+            match install(&app, screenpipe_dir.clone()).await {
+                Ok(handle) => {
+                    owned_browser.attach(handle).await;
+                    info!("owned-browser ready (after main window appeared)");
+                    return;
+                }
+                Err(e) => {
+                    // The window was visible in the check above but install
+                    // still failed. Could be a closing race; loop and try
+                    // again.
+                    tracing::debug!("owned-browser delayed install: {e}");
+                }
+            }
+        }
+    });
 }
 
 /// Create the owned-browser child webview if it doesn't exist yet, register

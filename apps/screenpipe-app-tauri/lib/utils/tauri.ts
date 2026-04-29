@@ -824,6 +824,32 @@ async piPrompt(sessionId: string | null, message: string, images: PiImageContent
 }
 },
 /**
+ * Read the current queued-prompt list for a session. Useful for an initial
+ * render before the first `pi-queue-changed` event arrives, and for new
+ * chat windows opening on top of an in-progress queue.
+ */
+async piPending(sessionId: string | null) : Promise<Result<PiQueuedPrompt[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_pending", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel a single queued prompt. Returns true if it was still in the queue
+ * (and is now removed), false if it had already been pulled into the
+ * in-flight slot — at that point `pi_abort` is the right tool.
+ */
+async piCancelQueued(sessionId: string | null, promptId: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_cancel_queued", { sessionId, promptId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Abort current Pi operation. Priority command — cancels all pending commands
  * in the queue and sends abort directly. Waits for the SDK's done event.
  */
@@ -1347,6 +1373,7 @@ export type PiCheckResult = { available: boolean; path: string | null }
  */
 export type PiImageContent = { type: string; mimeType: string; data: string }
 export type PiInfo = { running: boolean; projectDir: string | null; pid: number | null; sessionId: string | null }
+export type PiQueuedPrompt = { id: string; preview: string; queuedAtMs: number }
 /**
  * Configuration for which AI provider Pi should use
  */

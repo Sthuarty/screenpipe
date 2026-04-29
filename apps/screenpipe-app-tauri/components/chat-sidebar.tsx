@@ -53,6 +53,44 @@ interface ChatSidebarProps {
 }
 
 /**
+ * Tracks queued-prompt depth per session, sourced from the rust-side queue
+ * (`pi_command_queue.rs`). Single sidebar-wide subscription — re-rendering
+ * happens at this level, then each ChatRow reads its own depth from the map.
+ *
+ * The rust queue is the authoritative source: TS never adds entries here,
+ * only mirrors the snapshot rust pushes via `pi-queue-changed`.
+ */
+function useQueueDepths(): Map<string, number> {
+  const [depths, setDepths] = useState<Map<string, number>>(() => new Map());
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      const u = await listen<{ sessionId: string; queued: { id: string }[] }>(
+        "pi-queue-changed",
+        (e) => {
+          if (cancelled) return;
+          const { sessionId, queued } = e.payload;
+          setDepths((prev) => {
+            const next = new Map(prev);
+            const count = queued?.length ?? 0;
+            if (count === 0) next.delete(sessionId);
+            else next.set(sessionId, count);
+            return next;
+          });
+        }
+      );
+      unlisten = u;
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+  return depths;
+}
+
+/**
  * Embeddable. Designed to live INSIDE the main app sidebar, sandwiched
  * between the navigation items and the bottom action bar (Team / Settings
  * / Help). Takes whatever width its parent gives it; provides its own
@@ -67,6 +105,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
   const sessions = useOrderedSessions();
   const currentId = useChatStore((s) => s.currentId);
   const actions = useChatActions();
+  const queueDepths = useQueueDepths();
 
   // Sync currentId from standalone-chat. Whenever the chat panel switches
   // its piSessionIdRef (new chat, prefill auto-send, history click in the
@@ -242,6 +281,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
               key={s.id}
               session={s}
               isCurrent={s.id === currentId}
+              queuedCount={queueDepths.get(s.id) ?? 0}
               onSelect={handleSelect}
               onClose={handleClose}
               onTogglePin={handleTogglePin}
@@ -263,6 +303,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
             key={s.id}
             session={s}
             isCurrent={s.id === currentId}
+            queuedCount={queueDepths.get(s.id) ?? 0}
             onSelect={handleSelect}
             onClose={handleClose}
             onTogglePin={handleTogglePin}
@@ -663,6 +704,10 @@ function Section({
 interface ChatRowProps {
   session: SessionRecord;
   isCurrent: boolean;
+  /** Number of follow-up prompts queued for this session at the rust level.
+   *  > 0 → render an unobtrusive `↑N` badge so the user can spot pending
+   *  work in chats they've navigated away from. */
+  queuedCount: number;
   onSelect: (id: string) => void;
   onClose: (e: React.MouseEvent, id: string) => Promise<void> | void;
   onTogglePin: (e: React.MouseEvent, id: string) => Promise<void> | void;
@@ -693,6 +738,7 @@ interface ChatRowProps {
 function ChatRow({
   session,
   isCurrent,
+  queuedCount,
   onSelect,
   onClose,
   onTogglePin,
@@ -719,7 +765,7 @@ function ChatRow({
         "transition-colors",
         isCurrent
           ? "bg-muted/70 text-foreground"
-          : "text-foreground hover:bg-muted/40"
+          : "text-muted-foreground hover:bg-muted/40"
       )}
       data-testid={`chat-row-${session.id}`}
       title={isError && session.lastError ? session.lastError : undefined}
@@ -738,11 +784,24 @@ function ChatRow({
             "truncate flex-1 text-xs",
             isUnread
               ? "font-semibold text-foreground"
-              : "text-foreground"
+              : isCurrent
+                ? "text-foreground/80"
+                : "text-muted-foreground"
           )}
         >
           {session.title || "untitled"}
         </span>
+        {/* Queued-prompts badge — only visible when this session has rust-side
+            queued items waiting. Hidden on hover so it doesn't fight the
+            pin/close buttons for the same slot. */}
+        {queuedCount > 0 && (
+          <span
+            className="group-hover:hidden inline-flex items-center gap-0.5 px-1 text-[10px] font-mono text-muted-foreground/80 shrink-0"
+            title={`${queuedCount} queued`}
+          >
+            ↑{queuedCount}
+          </span>
+        )}
         {/* hover-only actions — REAL <button>s now (was <span role=button>
             inside the outer <button>, which is invalid nested-button HTML
             and made the X click silently no-op on close). */}

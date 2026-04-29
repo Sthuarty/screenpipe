@@ -65,8 +65,8 @@ pub fn video_quality_to_max_snapshot_width(quality: &str) -> u32 {
     match quality {
         "low" => 1280,
         "high" => 3840,
-        "max" => 0,        // native, no downscale
-        _ => 1920,         // "balanced" or any unknown
+        "max" => 0, // native, no downscale
+        _ => 1920,  // "balanced" or any unknown
     }
 }
 

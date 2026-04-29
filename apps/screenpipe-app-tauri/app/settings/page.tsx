@@ -11,7 +11,6 @@ import {
   User,
   Settings as SettingsIcon,
   HardDrive,
-  Plug,
   Shield,
   Layout,
   Users,
@@ -31,7 +30,6 @@ import ShortcutSection from "@/components/settings/shortcut-section";
 import { AIPresets } from "@/components/settings/ai-presets";
 import { RecordingSettings } from "@/components/settings/recording-settings";
 import GeneralSettings from "@/components/settings/general-settings";
-import { ConnectionsSection } from "@/components/settings/connections-section";
 import { TeamSection } from "@/components/settings/team-section";
 import { DisplaySection } from "@/components/settings/display-section";
 import { PrivacySection } from "@/components/settings/privacy-section";
@@ -52,7 +50,6 @@ type SettingsSection =
   | "general"
   | "display"
   | "shortcuts"
-  | "connections"
   | "privacy"
   | "storage"
   | "meetings"
@@ -64,7 +61,7 @@ type SettingsSection =
 
 const ALL_SETTINGS_SECTIONS: SettingsSection[] = [
   "display", "general", "ai", "recording", "shortcuts", "notifications",
-  "usage", "privacy", "storage", "meetings", "speakers", "connections",
+  "usage", "privacy", "storage", "meetings", "speakers",
   "team", "account", "referral",
 ];
 
@@ -181,6 +178,12 @@ function SettingsContent() {
     serialize: (v) => v,
   });
 
+  // Connections moved to the main sidebar — redirect any old deep-link to home.
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get("section");
+    if (raw === "connections") router.replace("/?section=connections");
+  }, [router]);
+
   // Enterprise guard: if the active section is hidden by policy, redirect to the
   // first visible section. Prevents direct-URL bypass of enterprise restrictions.
   useEffect(() => {
@@ -209,7 +212,6 @@ function SettingsContent() {
         { id: "storage" as const, label: "Storage", icon: <HardDrive className="h-4 w-4" /> },
         { id: "meetings" as const, label: "Meetings", icon: <Phone className="h-4 w-4" /> },
         { id: "speakers" as const, label: "Speakers", icon: <Mic className="h-4 w-4" /> },
-        { id: "connections" as const, label: "Connections", icon: <Plug className="h-4 w-4" /> },
       ].filter((s) => !isSectionHidden(s.id)),
     },
     {
@@ -237,7 +239,6 @@ function SettingsContent() {
       case "privacy":       return <PrivacySection />;
       case "storage":       return <StorageSection />;
       case "meetings":      return <MeetingsSection />;
-      case "connections":   return <ConnectionsSection />;
       case "team":          return <TeamSection />;
       case "notifications": return <NotificationsSettings />;
       case "referral":      return <ReferralSection />;
@@ -305,7 +306,7 @@ function SettingsContent() {
                       )}>
                         {item.icon}
                       </div>
-                      <span className={cn("text-sm truncate", section === item.id && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>
+                      <span className={cn("text-xs truncate", section === item.id && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>
                         {item.label}
                       </span>
                     </button>

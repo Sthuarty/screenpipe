@@ -13,7 +13,10 @@ on:
 
 concurrency:
   group: e2e-windows-${{ github.ref }}
-  cancel-in-progress: true
+  # Self-hosted runner; main pushes come faster than the 30+min run, so
+  # cancel-in-progress on main meant 99/100 runs got cancelled before
+  # producing any signal. Cancel only PRs, let main finish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1

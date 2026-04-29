@@ -1467,6 +1467,38 @@ pub async fn pi_start_inner(
     // Grab queue_state for the stdout reader before dropping the lock
     let queue_state_for_reader = pool.sessions.get(&sid).and_then(|m| m.queue_state.clone());
 
+    // Spawn a watcher that mirrors queue-pending changes out as Tauri events.
+    // The frontend uses these to render "queued" cards under the in-flight
+    // streaming message and badges in the sidebar — without this, the UI has
+    // no visibility into the rust-side mpsc state.
+    if let Some(qs) = queue_state_for_reader.clone() {
+        let app_handle_for_queue = app.clone();
+        let sid_for_queue = sid.clone();
+        tokio::spawn(async move {
+            let mut rx = qs.subscribe_queued();
+            // Emit current state immediately so any UI that subscribes after
+            // the watcher boot still gets a fresh value without polling.
+            let snap = rx.borrow().clone();
+            let _ = app_handle_for_queue.emit(
+                "pi-queue-changed",
+                serde_json::json!({
+                    "sessionId": sid_for_queue,
+                    "queued": snap,
+                }),
+            );
+            while rx.changed().await.is_ok() {
+                let snap = rx.borrow().clone();
+                let _ = app_handle_for_queue.emit(
+                    "pi-queue-changed",
+                    serde_json::json!({
+                        "session_id": sid_for_queue,
+                        "queued": snap,
+                    }),
+                );
+            }
+        });
+    }
+
     // Snapshot the state BEFORE dropping the lock, so we don't hold it during I/O
     let snapshot = match pool.sessions.get_mut(&sid) {
         Some(m) => m.snapshot(&sid),
@@ -1744,11 +1776,63 @@ pub async fn pi_prompt(
         }
     }
 
-    let rx = queue
-        .send(cmd, crate::pi_command_queue::WaitMode::StreamThenWaitDone)
+    // Send through the prompt-aware path so the queue UI shows it as queued
+    // until the drain loop pulls and writes it to stdin.
+    let (_queue_id, rx) = queue
+        .send_prompt(
+            cmd,
+            crate::pi_command_queue::WaitMode::StreamThenWaitDone,
+            message.clone(),
+        )
         .await?;
     rx.await
         .map_err(|_| "Pi command queue dropped".to_string())?
+}
+
+/// Cancel a single queued prompt. Returns true if it was still in the queue
+/// (and is now removed), false if it had already been pulled into the
+/// in-flight slot — at that point `pi_abort` is the right tool.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_cancel_queued(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+    prompt_id: String,
+) -> Result<bool, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let queue = {
+        let pool = state.0.lock().await;
+        let m = pool
+            .sessions
+            .get(&sid)
+            .ok_or("session not found".to_string())?;
+        m.queue_handle
+            .clone()
+            .ok_or("queue not initialized".to_string())?
+    };
+    queue.cancel_one(prompt_id).await
+}
+
+/// Read the current queued-prompt list for a session. Useful for an initial
+/// render before the first `pi-queue-changed` event arrives, and for new
+/// chat windows opening on top of an in-progress queue.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_pending(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+) -> Result<Vec<crate::pi_command_queue::PiQueuedPrompt>, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let pool = state.0.lock().await;
+    let m = match pool.sessions.get(&sid) {
+        Some(m) => m,
+        None => return Ok(Vec::new()),
+    };
+    let qs = match m.queue_state.as_ref() {
+        Some(qs) => qs,
+        None => return Ok(Vec::new()),
+    };
+    Ok(qs.queued_snapshot())
 }
 
 /// Abort current Pi operation. Priority command — cancels all pending commands

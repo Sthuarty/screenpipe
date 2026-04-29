@@ -39,9 +39,27 @@ interface NotificationPayload {
   pipe_name?: string;
 }
 
+/** Extract `path` from a `screenpipe://view?path=…` deeplink, or null. */
+function viewerPathFromHref(href: string): string | null {
+  if (!href.startsWith("screenpipe://view")) return null;
+  try {
+    const u = new URL(href);
+    return u.searchParams.get("path");
+  } catch {
+    return null;
+  }
+}
+
 async function openNotificationLink(href: string) {
   const raw = href.trim();
   if (!raw) return;
+
+  // Viewer deeplink — opens the file in the in-app viewer window.
+  const viewerPath = viewerPathFromHref(raw);
+  if (viewerPath) {
+    await invoke("open_viewer_window", { path: viewerPath });
+    return;
+  }
 
   let localPath: string | null = null;
   if (raw.startsWith("~/")) {
@@ -54,14 +72,6 @@ async function openNotificationLink(href: string) {
   }
 
   const { open } = await import("@tauri-apps/plugin-shell");
-  if (localPath && localPath.toLowerCase().endsWith(".md")) {
-    try {
-      await invoke("open_note_path", { path: localPath });
-      return;
-    } catch {
-      // Fallback to default file opener.
-    }
-  }
   if (localPath) {
     await invoke("open_note_path", { path: localPath });
     return;
@@ -527,22 +537,65 @@ export default function NotificationPanelPage() {
           >
             <ReactMarkdown
               components={{
-                a: ({ href, children }) => (
-                  <a
-                    onClick={async (e) => {
-                      e.preventDefault();
-                      if (!href) return;
-                      try {
-                        await openNotificationLink(href);
-                      } catch {
-                        console.error("failed to open url externally:", href);
-                      }
-                    }}
-                    style={{ color: "rgba(0, 0, 0, 0.7)", textDecoration: "underline", cursor: "pointer" }}
-                  >
-                    {children}
-                  </a>
-                ),
+                a: ({ href, children }) => {
+                  // Viewer deeplinks get a sibling ↗ button so the user can
+                  // override and open in the OS default app (e.g. Obsidian
+                  // for .md, Preview for .json).
+                  const viewerPath = href ? viewerPathFromHref(href) : null;
+                  return (
+                    <>
+                      <a
+                        onClick={async (e) => {
+                          e.preventDefault();
+                          if (!href) return;
+                          try {
+                            await openNotificationLink(href);
+                          } catch {
+                            console.error("failed to open url externally:", href);
+                          }
+                        }}
+                        style={{ color: "rgba(0, 0, 0, 0.7)", textDecoration: "underline", cursor: "pointer" }}
+                      >
+                        {children}
+                      </a>
+                      {viewerPath && (
+                        <button
+                          onClick={async (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            try {
+                              await invoke("open_note_path", { path: viewerPath });
+                            } catch (err) {
+                              console.error("failed to open in default app:", err);
+                            }
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.color = "rgba(0, 0, 0, 0.85)";
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.color = "rgba(0, 0, 0, 0.35)";
+                          }}
+                          title="open in default app"
+                          aria-label="open in default app"
+                          style={{
+                            marginLeft: "3px",
+                            padding: "0 3px",
+                            background: "transparent",
+                            border: "none",
+                            color: "rgba(0, 0, 0, 0.35)",
+                            fontSize: "10px",
+                            lineHeight: "1",
+                            cursor: "pointer",
+                            verticalAlign: "baseline",
+                            transition: "color 150ms",
+                          }}
+                        >
+                          ↗
+                        </button>
+                      )}
+                    </>
+                  );
+                },
               }}
             >{payload.body}</ReactMarkdown>
           </div>

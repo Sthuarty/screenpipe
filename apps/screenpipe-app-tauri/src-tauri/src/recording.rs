@@ -611,24 +611,15 @@ pub async fn spawn_screenpipe(
     // Owned-browser: create the connect-side instance and kick off the
     // webview install in the background. The engine starts immediately;
     // the handle attaches when the WebviewWindow is ready.
+    //
+    // `spawn_install_when_ready` survives tray-only mode by listening for
+    // `window-focused` events instead of giving up after a fixed budget.
     let owned_browser = screenpipe_connect::connections::browser::OwnedBrowser::default_instance();
-    {
-        let owned_for_install = owned_browser.clone();
-        let data_dir_for_install = recording_config.data_dir.clone();
-        tauri::async_runtime::spawn(async move {
-            match crate::owned_browser::install_with_retry(&app_for_owned, data_dir_for_install)
-                .await
-            {
-                Ok(handle) => {
-                    owned_for_install.attach(handle).await;
-                    info!("owned-browser ready");
-                }
-                Err(e) => {
-                    warn!("owned-browser install failed: {e} — agent will see ready=false");
-                }
-            }
-        });
-    }
+    crate::owned_browser::spawn_install_when_ready(
+        app_for_owned,
+        recording_config.data_dir.clone(),
+        owned_browser.clone(),
+    );
     let on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine> = Some(
         std::sync::Arc::new(move |pipe_name: &str, exec_id: i64, line: &str| {
             let inner = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {

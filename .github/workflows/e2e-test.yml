@@ -15,7 +15,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # See ci.yml — cancel superseded runs only on PR branches; let main
+  # always finish so we actually report a signal for every commit.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   windows-e2e-test:
@@ -139,6 +141,25 @@ jobs:
         args: "--no-sign --debug --no-bundle -- --features e2e"
         projectPath: "./apps/screenpipe-app-tauri"
         tauriScript: bunx tauri -v
+
+    # ORT_STRATEGY=system links against onnxruntime.lib but does NOT copy
+    # onnxruntime.dll next to the test binary the way the default
+    # download-binaries+copy-dylibs path would. Without a copy here the
+    # Windows DLL loader fails to find onnxruntime.dll at runtime and the
+    # screenpipe-server thread panics with "Failed to initialize ORT API"
+    # on the very first ort::api() call. Tauri's bundle step does this for
+    # release builds (see tauri.windows.conf.json resourcesMap), but
+    # `--no-bundle` skips it.
+    - name: Stage ONNX Runtime DLLs next to test binary
+      shell: pwsh
+      run: |
+        $src = "${{ github.workspace }}/ort-system-lib/lib"
+        $dst = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/target/debug"
+        if (-not (Test-Path $dst)) {
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+        }
+        Copy-Item -Path "$src/onnxruntime*.dll" -Destination $dst -Force
+        Get-ChildItem -Path $dst -Filter "onnxruntime*.dll" | Select-Object Name, Length
 
     - name: Run E2E Tests
       shell: pwsh

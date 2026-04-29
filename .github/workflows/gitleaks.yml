@@ -39,6 +39,7 @@ jobs:
           # both automatically from the GITHUB_EVENT_NAME — no extra
           # config needed.
           path: ./
-          # Exit non-zero on findings so the check fails loud, matching
-          # the prior gitleaks behavior.
-          extra_args: --only-verified --fail
+          # The action already passes --fail internally; passing it
+          # again here triggers `flag 'fail' cannot be repeated` from
+          # trufflehog's CLI parser.
+          extra_args: --only-verified

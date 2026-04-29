@@ -139,14 +139,68 @@ fn set_optimistic_status(status: RecordingStatus) {
 
 /// Pending "pause for X minutes" timer. Held so a manual resume — or a fresh
 /// pause click — can abort the previous one and prevent a stale auto-resume
-/// from firing later. No persistence: app quit / crash drops the timer and
+/// from firing later. The start instant + total duration are kept so the tray
+/// tooltip can show a live "resumes in 12m" countdown via the existing 5-sec
+/// updater loop. No persistence: app quit / crash drops the timer and
 /// recording stays paused, which is the safer default for a privacy bias.
-static PAUSE_TIMER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
+struct PauseTimer {
+    handle: JoinHandle<()>,
+    started: std::time::Instant,
+    total: std::time::Duration,
+}
+
+static PAUSE_TIMER: Lazy<Mutex<Option<PauseTimer>>> = Lazy::new(|| Mutex::new(None));
 
 fn cancel_pause_timer() {
-    if let Some(h) = PAUSE_TIMER.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        h.abort();
+    if let Some(t) = PAUSE_TIMER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        t.handle.abort();
     }
+}
+
+/// Remaining time until auto-resume, if a pause timer is currently active.
+/// Returns None if the timer has already fired or no timer is set.
+fn pause_remaining() -> Option<std::time::Duration> {
+    let guard = PAUSE_TIMER.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|t| {
+        let elapsed = t.started.elapsed();
+        if elapsed >= t.total {
+            None
+        } else {
+            Some(t.total - elapsed)
+        }
+    })
+}
+
+fn format_remaining(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 { format!("{}h", h) } else { format!("{}h {}m", h, m) }
+    } else if secs >= 60 {
+        format!("{}m", (secs + 59) / 60) // round up
+    } else {
+        format!("{}s", secs.max(1))
+    }
+}
+
+/// Fire-and-forget POST to the local /notify endpoint. Used for pause /
+/// auto-resume notifications; failures are swallowed (notifications are
+/// best-effort UI fluff, not load-bearing).
+fn send_notify(title: impl Into<String>, body: impl Into<String>) {
+    let payload = serde_json::json!({
+        "title": title.into(),
+        "body": body.into(),
+        "type": "system",
+    });
+    tauri::async_runtime::spawn(async move {
+        let client = reqwest::Client::new();
+        let _ = client
+            .post("http://127.0.0.1:11435/notify")
+            .json(&payload)
+            .send()
+            .await;
+    });
 }
 
 /// Immediately rebuild the tray menu (called from main thread after optimistic status set).
@@ -760,6 +814,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         id if id.starts_with("pause_") => {
             let mins: u64 = id.strip_prefix("pause_").and_then(|s| s.parse().ok()).unwrap_or(15);
+            let total = std::time::Duration::from_secs(mins * 60);
             // Cancel any in-flight pause timer before scheduling a new one.
             cancel_pause_timer();
             // Pause now (same path as the manual toggle).
@@ -768,13 +823,35 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
             tauri::async_runtime::spawn(async move {
                 let _ = app_for_stop.emit("shortcut-stop-recording", ());
             });
-            // Schedule auto-resume.
+            // Schedule auto-resume — also fires a notification so the user knows
+            // recording is back on without having to open the menu.
             let app_for_resume = app_handle.clone();
             let handle = tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(mins * 60)).await;
+                tokio::time::sleep(total).await;
                 let _ = app_for_resume.emit("shortcut-start-recording", ());
+                send_notify(
+                    "Recording resumed",
+                    "screenpipe is recording again.",
+                );
             });
-            *PAUSE_TIMER.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            *PAUSE_TIMER.lock().unwrap_or_else(|e| e.into_inner()) = Some(PauseTimer {
+                handle,
+                started: std::time::Instant::now(),
+                total,
+            });
+            // Tell the user via a system notification (the tray icon doesn't
+            // visually change between recording / paused, so the menubar gives
+            // no glance-level signal otherwise).
+            let pretty = if mins >= 60 {
+                let h = mins / 60;
+                if h == 1 { "1 hour".to_string() } else { format!("{} hours", h) }
+            } else {
+                format!("{} minutes", mins)
+            };
+            send_notify(
+                "Recording paused",
+                format!("screenpipe will auto-resume in {}.", pretty),
+            );
             // Repaint the tray so "Recording" flips to "Paused" immediately.
             let app_for_rebuild = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
@@ -1026,6 +1103,27 @@ async fn update_menu_if_needed(
         }
     };
 
+    // Tooltip refreshes every tick regardless of menu rebuild — countdown
+    // ("paused, resumes in 12m") needs to tick down even when no other state
+    // has changed. Cheap: just an NSString swap on the existing status item.
+    let has_perm_issue = new_state.has_permission_issue;
+    let tooltip: String = if has_perm_issue {
+        "screenpipe — ⚠️ permissions needed".to_string()
+    } else if effective_status == RecordingStatus::Paused {
+        match pause_remaining() {
+            Some(d) => format!("screenpipe — paused, resumes in {}", format_remaining(d)),
+            None => "screenpipe — paused".to_string(),
+        }
+    } else {
+        "screenpipe".to_string()
+    };
+    let app_for_tooltip = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = app_for_tooltip.tray_by_id("screenpipe_main") {
+            let _ = tray.set_tooltip(Some(&tooltip));
+        }
+    });
+
     if should_update {
         // IMPORTANT: All NSStatusItem/TrayIcon operations must happen on the main thread.
         // If the TrayIcon is dropped on a tokio thread (e.g., after recreate_tray removed
@@ -1033,7 +1131,6 @@ async fn update_menu_if_needed(
         // thread and crashes.
         let app_for_thread = app.clone();
         let update_item = update_item.clone();
-        let has_perm_issue = new_state.has_permission_issue;
         let _ = app.run_on_main_thread(move || {
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Some(tray) = app_for_thread.tray_by_id("screenpipe_main") {
@@ -1047,14 +1144,6 @@ async fn update_menu_if_needed(
                         }
                         let _ = tray.set_menu(Some(menu));
                     }
-                    debug!("tray_menu_update: setting tooltip");
-                    // Update tooltip to show permission status
-                    let tooltip = if has_perm_issue {
-                        "screenpipe — ⚠️ permissions needed"
-                    } else {
-                        "screenpipe"
-                    };
-                    let _ = tray.set_tooltip(Some(tooltip));
                 }
             })) {
                 let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {

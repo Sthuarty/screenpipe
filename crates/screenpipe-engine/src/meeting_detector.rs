@@ -23,6 +23,7 @@
 //! and non-meeting contexts (Slack chat, etc.). A mute button counts only when
 //! accompanied by a leave/hangup signal (see `min_signals_required`).
 
+use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
 use screenpipe_db::DatabaseManager;
@@ -2190,6 +2191,9 @@ pub async fn run_meeting_detection_loop(
     let mut cal_sub = subscribe_to_event::<Vec<CalendarEventSignal>>("calendar_events");
     let mut calendar_events: Vec<CalendarEventSignal> = Vec::new();
 
+    // Subscribe to explicit stop signals from the API layer
+    let mut stop_sub = subscribe_to_event::<DetectorStopSignal>("detector_stop_tracking");
+
     info!(
         "meeting v2: detection loop started (base_interval={:?}, profiles={})",
         base_interval,
@@ -2223,6 +2227,28 @@ pub async fn run_meeting_detection_loop(
         // Each publish replaces the full list, so we keep only the latest.
         while let Some(event) = cal_sub.next().now_or_never().flatten() {
             calendar_events = event.data.into_iter().filter(|e| !e.is_all_day).collect();
+        }
+
+        // Handle explicit stop signals from the API layer
+        if let Some(event) = stop_sub.next().now_or_never().flatten() {
+            let stop_signal = event.data;
+            if let MeetingState::Active {
+                meeting_id, app, ..
+            }
+            | MeetingState::Ending {
+                meeting_id, app, ..
+            } = &state
+            {
+                if *meeting_id == stop_signal.meeting_id && app == &stop_signal.app {
+                    info!(
+                        "meeting v2: forced to Idle by explicit stop (meeting_id={}, app={})",
+                        meeting_id, app
+                    );
+                    state = MeetingState::Idle;
+                    current_interval = IDLE_APPS_SCAN_INTERVAL;
+                    sync_meeting_flag(false, &in_meeting_flag, &detector);
+                }
+            }
         }
 
         // Skip if manual meeting is active
@@ -2298,6 +2324,11 @@ pub async fn run_meeting_detection_loop(
                             serde_json::json!({ "meeting_id": meeting_id }),
                         ) {
                             warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                        }
+                        if let Ok(status) =
+                            resolve_meeting_status_from(db.as_ref(), manual_meeting.as_ref()).await
+                        {
+                            emit_meeting_status_changed(&status);
                         }
                     }
                     Err(e) => {
@@ -2469,6 +2500,11 @@ pub async fn run_meeting_detection_loop(
                             is_browser,
                         };
                     }
+                    if let Ok(status) =
+                        resolve_meeting_status_from(db.as_ref(), manual_meeting.as_ref()).await
+                    {
+                        emit_meeting_status_changed(&status);
+                    }
                 }
                 StateAction::EndMeeting { meeting_id } => {
                     if meeting_id >= 0 {
@@ -2482,6 +2518,14 @@ pub async fn run_meeting_detection_loop(
                                     serde_json::json!({ "meeting_id": meeting_id }),
                                 ) {
                                     warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                                }
+                                if let Ok(status) = resolve_meeting_status_from(
+                                    db.as_ref(),
+                                    manual_meeting.as_ref(),
+                                )
+                                .await
+                                {
+                                    emit_meeting_status_changed(&status);
                                 }
                             }
                             Err(e) => {
@@ -2618,6 +2662,12 @@ struct CalendarEventSignal {
     pub attendees: Vec<String>,
     #[serde(default)]
     pub is_all_day: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DetectorStopSignal {
+    pub meeting_id: i64,
+    pub app: String,
 }
 
 /// Check if any non-all-day calendar event overlaps with the current time.

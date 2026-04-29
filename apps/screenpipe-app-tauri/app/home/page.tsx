@@ -20,6 +20,7 @@ import {
   Search,
   Sparkles,
   Phone,
+  Plug,
   X,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
@@ -31,6 +32,7 @@ import { usePlatform } from "@/lib/hooks/use-platform";
 import { FeedbackSection } from "@/components/settings/feedback-section";
 import { PipeStoreView } from "@/components/pipe-store";
 import { MemoriesSection } from "@/components/settings/memories-section";
+import { ConnectionsSection } from "@/components/settings/connections-section";
 import { StandaloneChat } from "@/components/standalone-chat";
 import { ChatSidebar } from "@/components/chat-sidebar";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
@@ -47,9 +49,9 @@ import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import { computeMeetingActive, type MeetingRow } from "@/lib/utils/meeting-state";
+import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
 import { useRouter } from "next/navigation";
-import { localFetch } from "@/lib/api";
+import { appendAuthToken, ensureApiReady, getApiBaseUrl, localFetch } from "@/lib/api";
 import {
   Tooltip,
   TooltipContent,
@@ -57,18 +59,18 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
-type MainSection = "home" | "timeline" | "memories" | "pipes" | "help";
+type MainSection = "home" | "timeline" | "memories" | "pipes" | "connections" | "help";
 
 // All valid URL sections for the home page
 const ALL_SECTIONS = [
-  "home", "timeline", "pipes", "help", "memories",
+  "home", "timeline", "pipes", "help", "memories", "connections",
   "feedback", // backwards compat → maps to "help"
 ];
 
 // Settings sections that should redirect to /settings
 const SETTINGS_SECTIONS = new Set<string>([
   "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
-  "connections", "privacy", "storage", "meetings", "team", "referral", "usage", "speakers",
+  "privacy", "storage", "meetings", "team", "referral", "usage", "speakers",
   "disk-usage", "cloud-archive", "cloud-sync", // backwards compat → maps to "storage"
 ]);
 
@@ -258,11 +260,17 @@ function HomeContent() {
   }, [settings.monitorIds, settings.useAllMonitors]);
 
   // Active meeting state — lights up the phone icon for ANY active meeting
-  // (manual OR auto-detected: Teams, Zoom, etc.). manualActive is true only
-  // when the user can stop it via the icon click.
-  const [meetingState, setMeetingState] = useState<{ active: boolean; manualActive: boolean }>(
-    { active: false, manualActive: false },
-  );
+  // (manual OR auto-detected: Teams, Zoom, etc.).
+  const [meetingState, setMeetingState] = useState<MeetingStatusResponse & {
+    manualActive: boolean;
+  }>({
+    active: false,
+    manualActive: false,
+    activeMeetingId: null,
+    stoppableMeetingId: null,
+    meetingApp: null,
+    detectionSource: null,
+  });
   const [meetingLoading, setMeetingLoading] = useState(false);
 
   // Timestamp when user clicked start, used for a 10s grace period so a
@@ -270,34 +278,79 @@ function HomeContent() {
   const manualMeetingStartedAt = useRef<number>(0);
   useEffect(() => {
     let cancelled = false;
-    const check = () => {
-      localFetch("/meetings?limit=5")
-        .then((r) => r.ok ? r.json() : [])
-        .then((meetings: MeetingRow[]) => {
+    let ws: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let backoffMs = 1000;
+
+    const connect = () => {
+      void (async () => {
+        try {
+          await ensureApiReady();
           if (cancelled) return;
-          setMeetingState(
-            computeMeetingActive(meetings, manualMeetingStartedAt.current),
-          );
-        })
-        .catch(() => {});
+          const wsBase = getApiBaseUrl().replace("http://", "ws://");
+          ws = new WebSocket(appendAuthToken(`${wsBase}/ws/meeting-status`));
+          ws.onopen = () => {
+            backoffMs = 1000;
+          };
+          ws.onmessage = (event) => {
+            try {
+              const parsed = JSON.parse(event.data) as MeetingStatusResponse;
+              if (cancelled) return;
+              setMeetingState(
+                computeMeetingActive(parsed, manualMeetingStartedAt.current),
+              );
+            } catch {
+              // ignore malformed event payloads
+            }
+          };
+          ws.onclose = (event) => {
+            if (cancelled || event.code === 1000) return;
+            retry = setTimeout(connect, backoffMs);
+            backoffMs = Math.min(backoffMs * 2, 10000);
+          };
+          ws.onerror = () => {
+            ws?.close();
+          };
+        } catch {
+          if (cancelled) return;
+          retry = setTimeout(connect, backoffMs);
+          backoffMs = Math.min(backoffMs * 2, 10000);
+        }
+      })();
     };
-    check();
-    const interval = setInterval(check, 5000);
-    return () => { cancelled = true; clearInterval(interval); };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (retry) clearTimeout(retry);
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close(1000, "unmount");
+      }
+    };
   }, []);
 
   const toggleMeeting = useCallback(async () => {
     setMeetingLoading(true);
     try {
-      if (meetingState.manualActive) {
-        // Stop the manual meeting we previously started
-        await localFetch("/meetings/stop", { method: "POST" });
-        manualMeetingStartedAt.current = 0;
-        setMeetingState({ active: false, manualActive: false });
-      } else if (meetingState.active) {
-        // Auto-detected meeting in progress — icon is a passive indicator,
-        // user can't stop someone else's Teams/Zoom call from here
-        return;
+      if (meetingState.active) {
+        // Stop the currently active meeting, whether manual or auto-detected.
+        const targetId = meetingState.stoppableMeetingId;
+        const res = await localFetch("/meetings/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: targetId }),
+        });
+        if (res.ok) {
+          manualMeetingStartedAt.current = 0;
+          setMeetingState({
+            active: false,
+            manualActive: false,
+            activeMeetingId: null,
+            stoppableMeetingId: null,
+            meetingApp: null,
+            detectionSource: null,
+          });
+        }
       } else {
         // No meeting active — start a manual one
         const res = await localFetch("/meetings/start", {
@@ -307,7 +360,14 @@ function HomeContent() {
         });
         if (res.ok) {
           manualMeetingStartedAt.current = Date.now();
-          setMeetingState({ active: true, manualActive: true });
+          setMeetingState({
+            active: true,
+            manualActive: true,
+            activeMeetingId: null,
+            stoppableMeetingId: null,
+            meetingApp: "manual",
+            detectionSource: "manual",
+          });
         }
       }
     } catch (e) {
@@ -317,14 +377,41 @@ function HomeContent() {
     }
   }, [meetingState]);
 
-  // Native overlay: toggle meeting when user clicks phone icon in Swift overlay
+  // Native overlay already toggles the meeting in Rust. Refresh local state
+  // here instead of toggling again, otherwise one click can create or stop
+  // two meetings depending on which UI surfaces are mounted.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    listen("native-shortcut-toggle-meeting", () => {
-      toggleMeeting();
+    listen<MeetingStatusResponse>("native-shortcut-toggle-meeting", (event) => {
+      const payload = event.payload;
+      if (typeof payload?.active === "boolean") {
+        if (payload.active) {
+          manualMeetingStartedAt.current = Date.now();
+        } else {
+          manualMeetingStartedAt.current = 0;
+        }
+        setMeetingState({
+          active: payload.active,
+          manualActive: payload.manualActive ?? false,
+          activeMeetingId: payload.activeMeetingId ?? null,
+          stoppableMeetingId: payload.stoppableMeetingId ?? payload.activeMeetingId ?? null,
+          meetingApp: payload.meetingApp ?? null,
+          detectionSource: payload.detectionSource ?? null,
+        });
+        return;
+      }
+      void (async () => {
+        try {
+          const res = await localFetch("/meetings/status");
+          const status = res.ok ? await res.json() as MeetingStatusResponse : null;
+          setMeetingState(computeMeetingActive(status, manualMeetingStartedAt.current));
+        } catch {
+          // ignore sync failures; websocket remains source of truth
+        }
+      })();
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
-  }, [toggleMeeting]);
+  }, []);
 
   // Watch pipe: navigate to chat when user clicks "watch" on a running pipe
   useEffect(() => {
@@ -343,11 +430,17 @@ function HomeContent() {
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
-      openSettings(detail?.section ?? "general");
+      const section = detail?.section ?? "general";
+      // connections is a top-level main-sidebar section now, not in settings
+      if (section === "connections") {
+        setActiveSection("connections");
+        return;
+      }
+      openSettings(section);
     };
     window.addEventListener("open-settings", handler);
     return () => window.removeEventListener("open-settings", handler);
-  }, [openSettings]);
+  }, [openSettings, setActiveSection]);
 
   const renderMainSection = () => {
     if (isSectionHidden(activeSection) && activeSection !== "help") {
@@ -370,6 +463,8 @@ function HomeContent() {
         return <MemoriesSection />;
       case "pipes":
         return <PipeStoreView />;
+      case "connections":
+        return <ConnectionsSection />;
       case "help":
         return <FeedbackSection />;
       default:
@@ -391,6 +486,7 @@ function HomeContent() {
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-3.5 w-3.5" /> },
     { id: "timeline", label: "Timeline", icon: <Clock className="h-3.5 w-3.5" /> },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-3.5 w-3.5" /> },
+    { id: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
   ].filter((s) => !isSectionHidden(s.id));
 
   // Listen for navigation events from other windows (e.g. tray, Rust-side links)
@@ -555,7 +651,7 @@ function HomeContent() {
                       <TooltipTrigger asChild>
                         <button
                           onClick={toggleMeeting}
-                          disabled={meetingLoading || (meetingState.active && !meetingState.manualActive)}
+                          disabled={meetingLoading}
                           className={cn(
                             "relative flex items-center justify-center h-5 w-5 rounded transition-colors",
                             isTranslucent ? "vibrant-nav-item hover:bg-white/10" : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -564,11 +660,11 @@ function HomeContent() {
                           {meetingState.active && (
                             <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
                           )}
-                          <Phone className="h-3 w-3" />
+                          <Phone className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
                         </button>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="text-xs">
-                        {meetingState.manualActive ? "stop meeting" : meetingState.active ? "meeting detected" : "start meeting"}
+                        {meetingState.active ? "stop meeting" : "start meeting"}
                       </TooltipContent>
                     </Tooltip>
                   </div>

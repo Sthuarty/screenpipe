@@ -3330,7 +3330,10 @@ impl PipeManager {
                     // One-off (`schedule: at <iso>`) auto-disables on fire so
                     // it never runs twice — even across crashes/restarts. The
                     // pipe.md stays on disk; only the local-override flag flips.
-                    if matches!(parse_schedule(&config.schedule), Some(ParsedSchedule::Once(_))) {
+                    if matches!(
+                        parse_schedule(&config.schedule),
+                        Some(ParsedSchedule::Once(_))
+                    ) {
                         if let Err(e) = set_local_override(&pipes_dir, name, false) {
                             warn!(
                                 "scheduler: failed to auto-disable one-off pipe '{}': {}",

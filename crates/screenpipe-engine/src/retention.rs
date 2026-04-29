@@ -11,6 +11,7 @@ use axum::{
     response::Json as JsonResponse,
 };
 use chrono::{DateTime, Duration, Utc};
+use clap::ValueEnum;
 use oasgen::{oasgen, OaSchema};
 use screenpipe_db::DatabaseManager;
 use serde::{Deserialize, Serialize};
@@ -52,10 +53,29 @@ struct RetentionRuntime {
     run_now: Arc<tokio::sync::Notify>,
 }
 
+/// What old data gets cleaned up. `Media` (default) keeps DB rows (search,
+/// timeline, transcripts) and only reclaims mp4/wav/jpeg files; `All` is the
+/// legacy behavior that wipes everything past the cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, OaSchema, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum RetentionMode {
+    Media,
+    All,
+}
+
+impl Default for RetentionMode {
+    fn default() -> Self {
+        Self::Media
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionConfig {
     pub enabled: bool,
     pub retention_days: u32,
+    #[serde(default)]
+    pub mode: RetentionMode,
 }
 
 impl Default for RetentionConfig {
@@ -63,6 +83,7 @@ impl Default for RetentionConfig {
         Self {
             enabled: false,
             retention_days: 14,
+            mode: RetentionMode::Media,
         }
     }
 }
@@ -75,12 +96,15 @@ impl Default for RetentionConfig {
 pub struct RetentionConfigureRequest {
     pub enabled: Option<bool>,
     pub retention_days: Option<u32>,
+    /// "media" (default) or "all". Omit to leave unchanged.
+    pub mode: Option<RetentionMode>,
 }
 
 #[derive(Debug, Serialize, OaSchema)]
 pub struct RetentionStatusResponse {
     pub enabled: bool,
     pub retention_days: u32,
+    pub mode: RetentionMode,
     pub last_cleanup: Option<String>,
     pub last_error: Option<String>,
     pub total_deleted: u64,
@@ -116,6 +140,9 @@ pub async fn retention_configure(
             if let Some(days) = request.retention_days {
                 runtime.config.retention_days = days;
             }
+            if let Some(mode) = request.mode {
+                runtime.config.mode = mode;
+            }
 
             if !wants_enabled && runtime.config.enabled {
                 // Disable: abort background task
@@ -134,8 +161,8 @@ pub async fn retention_configure(
                     run_now,
                 );
                 info!(
-                    "retention: re-enabled with {}d",
-                    runtime.config.retention_days
+                    "retention: re-enabled with {}d ({:?})",
+                    runtime.config.retention_days, runtime.config.mode
                 );
             }
 
@@ -143,6 +170,7 @@ pub async fn retention_configure(
                 "success": true,
                 "enabled": runtime.config.enabled,
                 "retention_days": runtime.config.retention_days,
+                "mode": runtime.config.mode,
             })))
         }
         None => {
@@ -151,6 +179,7 @@ pub async fn retention_configure(
                     "success": true,
                     "enabled": false,
                     "retention_days": retention_days,
+                    "mode": request.mode.unwrap_or_default(),
                 })));
             }
 
@@ -158,6 +187,7 @@ pub async fn retention_configure(
             let config = RetentionConfig {
                 enabled: true,
                 retention_days,
+                mode: request.mode.unwrap_or_default(),
             };
 
             let run_now = Arc::new(tokio::sync::Notify::new());
@@ -186,6 +216,7 @@ pub async fn retention_configure(
                 "success": true,
                 "enabled": true,
                 "retention_days": retention_days,
+                "mode": request.mode.unwrap_or_default(),
             })))
         }
     }
@@ -202,6 +233,7 @@ pub async fn retention_status(
         None => Ok(JsonResponse(RetentionStatusResponse {
             enabled: false,
             retention_days: 14,
+            mode: RetentionMode::Media,
             last_cleanup: None,
             last_error: None,
             total_deleted: 0,
@@ -209,6 +241,7 @@ pub async fn retention_status(
         Some(runtime) => Ok(JsonResponse(RetentionStatusResponse {
             enabled: runtime.config.enabled,
             retention_days: runtime.config.retention_days,
+            mode: runtime.config.mode,
             last_cleanup: runtime.last_cleanup.map(|t| t.to_rfc3339()),
             last_error: runtime.last_error.clone(),
             total_deleted: runtime.total_deleted,
@@ -268,10 +301,10 @@ fn spawn_retention_loop(
                 }
             }
 
-            let retention_days = {
+            let (retention_days, mode) = {
                 let guard = state.read().await;
                 match guard.as_ref() {
-                    Some(rt) if rt.config.enabled => rt.config.retention_days,
+                    Some(rt) if rt.config.enabled => (rt.config.retention_days, rt.config.mode),
                     _ => continue,
                 }
             };
@@ -279,12 +312,13 @@ fn spawn_retention_loop(
             let cutoff = Utc::now() - Duration::days(retention_days as i64);
 
             info!(
-                "retention: cleaning up data before {} ({}d retention)",
+                "retention: cleaning up data before {} ({}d retention, mode={:?})",
                 cutoff.to_rfc3339(),
-                retention_days
+                retention_days,
+                mode
             );
 
-            match do_local_cleanup(&db, cutoff).await {
+            match do_local_cleanup(&db, cutoff, mode).await {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("retention: deleted {} records", deleted);
@@ -308,10 +342,11 @@ fn spawn_retention_loop(
     })
 }
 
-async fn do_local_cleanup(db: &Arc<DatabaseManager>, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
-    // Delete in 1-hour batches. Each batch only deletes time-bounded rows
-    // (fast, uses indexed timestamp). The expensive orphan cleanup (full-table
-    // NOT IN scans on video_chunks/audio_chunks) runs once at the end.
+async fn do_local_cleanup(
+    db: &Arc<DatabaseManager>,
+    cutoff: DateTime<Utc>,
+    mode: RetentionMode,
+) -> anyhow::Result<u64> {
     let batch_size = Duration::hours(1);
     let mut total: u64 = 0;
 
@@ -330,50 +365,94 @@ async fn do_local_cleanup(db: &Arc<DatabaseManager>, cutoff: DateTime<Utc>) -> a
     while batch_start < cutoff {
         let batch_end = (batch_start + batch_size).min(cutoff);
 
-        match db
-            .delete_time_range_batch(batch_start, batch_end, true)
-            .await
-        {
-            Ok(result) => {
-                let batch_total = result.frames_deleted
-                    + result.ocr_deleted
-                    + result.audio_transcriptions_deleted
-                    + result.ui_events_deleted;
-
-                if batch_total > 0 {
-                    any_deleted = true;
-                    info!(
-                        "retention: batch deleted frames={} ocr={} audio={} ui_events={} \
-                         (video_files={} snapshot_files={} audio_files={})",
-                        result.frames_deleted,
-                        result.ocr_deleted,
-                        result.audio_transcriptions_deleted,
-                        result.ui_events_deleted,
-                        result.video_files.len(),
-                        result.snapshot_files.len(),
-                        result.audio_files.len(),
-                    );
-                }
-
-                total += batch_total;
-
-                for path in result
-                    .video_files
-                    .iter()
-                    .chain(result.audio_files.iter())
-                    .chain(result.snapshot_files.iter())
+        match mode {
+            RetentionMode::All => {
+                match db
+                    .delete_time_range_batch(batch_start, batch_end, true)
+                    .await
                 {
-                    if let Err(e) = tokio::fs::remove_file(path).await {
-                        warn!("retention: failed to delete file {}: {}", path, e);
+                    Ok(result) => {
+                        let batch_total = result.frames_deleted
+                            + result.ocr_deleted
+                            + result.audio_transcriptions_deleted
+                            + result.ui_events_deleted;
+
+                        if batch_total > 0 {
+                            any_deleted = true;
+                            info!(
+                                "retention: batch deleted frames={} ocr={} audio={} ui_events={} \
+                                 (video_files={} snapshot_files={} audio_files={})",
+                                result.frames_deleted,
+                                result.ocr_deleted,
+                                result.audio_transcriptions_deleted,
+                                result.ui_events_deleted,
+                                result.video_files.len(),
+                                result.snapshot_files.len(),
+                                result.audio_files.len(),
+                            );
+                        }
+
+                        total += batch_total;
+
+                        for path in result
+                            .video_files
+                            .iter()
+                            .chain(result.audio_files.iter())
+                            .chain(result.snapshot_files.iter())
+                        {
+                            if let Err(e) = tokio::fs::remove_file(path).await {
+                                warn!("retention: failed to delete file {}: {}", path, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "retention: batch delete failed for range {} to {}: {}",
+                            batch_start, batch_end, e
+                        );
                     }
                 }
             }
-            Err(e) => {
-                warn!(
-                    "retention: batch delete failed for range {} to {}: {}",
-                    batch_start, batch_end, e
-                );
-            }
+            RetentionMode::Media => match db.evict_media_in_range(batch_start, batch_end).await {
+                Ok(result) => {
+                    let batch_total = result.video_chunks_evicted
+                        + result.audio_chunks_evicted
+                        + result.snapshots_evicted;
+
+                    if batch_total > 0 {
+                        any_deleted = true;
+                        info!(
+                            "retention: batch evicted video_chunks={} audio_chunks={} snapshots={} \
+                             (files: video={} audio={} snapshots={})",
+                            result.video_chunks_evicted,
+                            result.audio_chunks_evicted,
+                            result.snapshots_evicted,
+                            result.video_files.len(),
+                            result.audio_files.len(),
+                            result.snapshot_files.len(),
+                        );
+                    }
+
+                    total += batch_total;
+
+                    for path in result
+                        .video_files
+                        .iter()
+                        .chain(result.audio_files.iter())
+                        .chain(result.snapshot_files.iter())
+                    {
+                        if let Err(e) = tokio::fs::remove_file(path).await {
+                            warn!("retention: failed to evict file {}: {}", path, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "retention: batch evict failed for range {} to {}: {}",
+                        batch_start, batch_end, e
+                    );
+                }
+            },
         }
 
         batch_start = batch_end;
@@ -382,12 +461,10 @@ async fn do_local_cleanup(db: &Arc<DatabaseManager>, cutoff: DateTime<Utc>) -> a
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    // One-time orphan cleanup after all batches
-    if any_deleted {
+    if any_deleted && matches!(mode, RetentionMode::All) {
         if let Err(e) = db.cleanup_orphaned_chunks().await {
             warn!("retention: orphan chunk cleanup failed: {}", e);
         }
-        // Reclaim disk space — without VACUUM, SQLite keeps deleted pages
         info!("retention: running incremental vacuum to reclaim disk space");
         if let Err(e) = db.execute_raw_sql("PRAGMA incremental_vacuum(1000)").await {
             warn!("retention: incremental vacuum failed: {}", e);

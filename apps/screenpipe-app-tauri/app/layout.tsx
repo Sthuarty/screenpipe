@@ -185,14 +185,19 @@ export default function RootLayout({
           dangerouslySetInnerHTML={{
             __html: `
               (function() {
+                // Apply theme to prevent flash and ensure sidebar/main content consistency.
+                // Priority: stored preference > system preference
                 try {
                   var theme = localStorage.getItem('screenpipe-ui-theme');
-                  if (!theme) {
+                  if (!theme || theme === 'system') {
+                    // No preference or 'system' mode: detect system preference for consistent startup
                     theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
                   }
                   document.documentElement.classList.add(theme);
                 } catch (e) {
-                  document.documentElement.classList.add('light');
+                  // localStorage unavailable, detect system preference as fallback
+                  var systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                  document.documentElement.classList.add(systemTheme);
                 }
 
                 // Crash recovery: if React fails to render, the page stays blank.

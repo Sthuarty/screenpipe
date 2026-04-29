@@ -16,6 +16,7 @@ mod ffi {
         pub fn shortcut_is_available() -> c_int;
         pub fn shortcut_show(json: *const c_char) -> c_int;
         pub fn shortcut_hide() -> c_int;
+        pub fn shortcut_set_meeting_active(active: c_int);
         pub fn shortcut_set_action_callback(cb: Option<extern "C" fn(*const c_char)>);
     }
 
@@ -40,6 +41,12 @@ mod ffi {
         unsafe { shortcut_hide() == 0 }
     }
 
+    pub fn set_meeting_active(active: bool) {
+        unsafe {
+            shortcut_set_meeting_active(if active { 1 } else { 0 });
+        }
+    }
+
     pub fn set_action_callback(cb: extern "C" fn(*const c_char)) {
         unsafe {
             shortcut_set_action_callback(Some(cb));
@@ -59,6 +66,7 @@ mod ffi {
     pub fn hide() -> bool {
         false
     }
+    pub fn set_meeting_active(_active: bool) {}
     pub fn set_action_callback(_cb: extern "C" fn(*const std::os::raw::c_char)) {}
 }
 

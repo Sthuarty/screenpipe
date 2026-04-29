@@ -4,6 +4,7 @@
 
 //! Axum route handlers for notification CRUD and the `POST /notify` display endpoint.
 
+use super::rewrite::rewrite_file_links;
 use super::store::{self, NotificationHistoryEntry};
 use crate::server::{ApiResponse, ServerState};
 use axum::extract::{Path, State};
@@ -23,11 +24,16 @@ pub async fn send_notification(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let dismiss_ms = payload.auto_dismiss_ms.or(payload.timeout).unwrap_or(20000);
 
+    // Rewrite file-path markdown links to screenpipe://view?path=… so they
+    // open in the in-app viewer instead of the OS default app (Xcode for
+    // .md, Preview for .json, etc.). External URLs pass through untouched.
+    let body = rewrite_file_links(&payload.body);
+
     let panel_payload = serde_json::json!({
         "id": panel_id,
         "type": payload.notification_type.unwrap_or_else(|| "pipe".to_string()),
         "title": payload.title,
-        "body": payload.body,
+        "body": body,
         "actions": payload.actions,
         "autoDismissMs": dismiss_ms,
     });
@@ -37,7 +43,7 @@ pub async fn send_notification(
         id: panel_id.clone(),
         notification_type: panel_payload["type"].as_str().unwrap_or("pipe").to_string(),
         title: payload.title.clone(),
-        body: payload.body.clone(),
+        body: body.clone(),
         pipe_name: None,
         timestamp: chrono::Utc::now().to_rfc3339(),
         read: false,

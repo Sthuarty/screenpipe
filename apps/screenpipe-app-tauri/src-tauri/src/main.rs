@@ -114,6 +114,7 @@ mod notifications;
 mod safe_icon;
 mod shortcuts;
 mod vault;
+mod viewer;
 use base64::Engine;
 use health::start_health_check;
 use log_files::{get_log_files, get_screenpipe_data_dir};
@@ -738,6 +739,10 @@ async fn main() {
                 // Notification panel commands
                 commands::show_notification_panel,
                 commands::hide_notification_panel,
+                // In-app file viewer
+                viewer::open_viewer_window,
+                viewer::read_viewer_file,
+                viewer::reveal_in_default_browser,
                 // Window-specific shortcut commands (dynamic registration)
                 commands::register_window_shortcuts,
                 commands::unregister_window_shortcuts,
@@ -772,6 +777,8 @@ async fn main() {
                 pi::pi_check,
                 pi::pi_install,
                 pi::pi_prompt,
+                pi::pi_pending,
+                pi::pi_cancel_queued,
                 pi::pi_abort,
                 pi::pi_new_session,
                 pi::pi_set_model,
@@ -1039,6 +1046,10 @@ async fn main() {
             commands::copy_deeplink_to_clipboard,
             commands::copy_text_to_clipboard,
             commands::open_note_path,
+            // In-app file viewer
+            viewer::open_viewer_window,
+            viewer::read_viewer_file,
+            viewer::reveal_in_default_browser,
             // Overlay commands (Windows)
             commands::enable_overlay_click_through,
             commands::disable_overlay_click_through,
@@ -1072,6 +1083,8 @@ async fn main() {
             pi::pi_check,
             pi::pi_install,
             pi::pi_prompt,
+            pi::pi_pending,
+            pi::pi_cancel_queued,
             pi::pi_abort,
             pi::pi_new_session,
             pi::pi_set_model,
@@ -1246,12 +1259,12 @@ async fn main() {
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_writer(file_appender)
                 .with_ansi(false)
-                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn"));
+                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn,ort=warn"));
 
             // Create a custom layer for console logging
             let console_layer = tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stdout)
-                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn"));
+                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn,ort=warn"));
 
             // Initialize the tracing subscriber with both layers + optional Sentry layer
             // The Sentry layer captures error!() and warn!() events (not just panics)
@@ -1691,24 +1704,17 @@ async fn main() {
                             // Webview build is async — kick it off in the background and
                             // attach the handle once the WebviewWindow is ready. Until
                             // then, /connections/browsers/owned-default/eval returns 503.
+                            //
+                            // `spawn_install_when_ready` survives tray-only mode by
+                            // listening for `window-focused` events instead of giving
+                            // up after a fixed budget.
                             let owned_browser =
                                 screenpipe_connect::connections::browser::OwnedBrowser::default_instance();
-                            {
-                                let owned_for_install = owned_browser.clone();
-                                let app_for_install = app_for_owned.clone();
-                                let data_dir_for_install = config.data_dir.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    match crate::owned_browser::install_with_retry(&app_for_install, data_dir_for_install).await {
-                                        Ok(handle) => {
-                                            owned_for_install.attach(handle).await;
-                                            info!("owned-browser ready");
-                                        }
-                                        Err(e) => {
-                                            warn!("owned-browser install failed: {e} — agent will see ready=false");
-                                        }
-                                    }
-                                });
-                            }
+                            crate::owned_browser::spawn_install_when_ready(
+                                app_for_owned.clone(),
+                                config.data_dir.clone(),
+                                owned_browser.clone(),
+                            );
 
                             // Phase 1: Start server core
                             let server = match server_core::ServerCore::start(

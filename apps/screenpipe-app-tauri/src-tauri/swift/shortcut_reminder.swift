@@ -15,6 +15,13 @@ public func shortcutSetActionCallback(_ cb: @escaping ShortcutActionCallback) {
     gShortcutCallback = cb
 }
 
+@_cdecl("shortcut_set_meeting_active")
+public func shortcutSetMeetingActive(_ active: Int32) {
+    if #available(macOS 13.0, *) {
+        ShortcutReminderController.shared.setMeetingActive(active != 0)
+    }
+}
+
 // MARK: - Metrics data pushed from Rust
 
 struct OverlayMetrics {
@@ -371,12 +378,13 @@ class ShortcutReminderController: NSObject {
     @Published var isExpanded = false
     private var wsTask: URLSessionWebSocketTask?
     private var wsRetryTimer: Timer?
-    private var meetingPollTimer: Timer?
+    private var meetingWsTask: URLSessionWebSocketTask?
+    private var meetingWsRetryTimer: Timer?
     private var prevFramesCaptured: Int?
     private var prevOcrCompleted: Int?
     /// Set from Rust `show_shortcut_reminder` when API auth is enabled (includes ?token=).
     private var metricsWsUrl = "ws://127.0.0.1:3030/ws/metrics"
-    private var meetingsStatusUrl = "http://127.0.0.1:3030/meetings/status"
+    private var eventsWsUrl = "ws://127.0.0.1:3030/ws/meeting-status"
 
     func show(shortcuts: String?) {
         DispatchQueue.main.async { [self] in
@@ -397,15 +405,14 @@ class ShortcutReminderController: NSObject {
             panel?.orderFrontRegardless()
             AnimationTick.shared.start()
             connectWebSocket()
-            startMeetingPoll()
+            connectMeetingEventsWebSocket()
         }
     }
 
     func hide() {
         AnimationTick.shared.stop()
         disconnectWebSocket()
-        meetingPollTimer?.invalidate()
-        meetingPollTimer = nil
+        disconnectMeetingEventsWebSocket()
         DispatchQueue.main.async { [self] in
             panel?.orderOut(nil)
         }
@@ -478,29 +485,58 @@ class ShortcutReminderController: NSObject {
         }
     }
 
-    // MARK: - Meeting status polling
+    // MARK: - Meeting status events
 
-    private func startMeetingPoll() {
-        checkMeetingStatus()
-        meetingPollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.checkMeetingStatus()
-        }
-        RunLoop.main.add(meetingPollTimer!, forMode: .common)
+    private func connectMeetingEventsWebSocket() {
+        disconnectMeetingEventsWebSocket()
+        guard let url = URL(string: eventsWsUrl) else { return }
+        let session = URLSession(configuration: .default)
+        let task = session.webSocketTask(with: url)
+        self.meetingWsTask = task
+        task.resume()
+        receiveMeetingEvent()
     }
 
-    private func checkMeetingStatus() {
-        guard let url = URL(string: meetingsStatusUrl) else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            guard let self = self, let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-            let active = json["active"] as? Bool ?? false
-            DispatchQueue.main.async {
-                if self.metrics.meetingActive != active {
-                    self.metrics.meetingActive = active
-                    self.updateContent()
+    private func disconnectMeetingEventsWebSocket() {
+        meetingWsRetryTimer?.invalidate()
+        meetingWsRetryTimer = nil
+        meetingWsTask?.cancel(with: .goingAway, reason: nil)
+        meetingWsTask = nil
+    }
+
+    private func receiveMeetingEvent() {
+        meetingWsTask?.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let message):
+                if case .string(let text) = message {
+                    self.processMeetingEventMessage(text)
+                }
+                self.receiveMeetingEvent()
+            case .failure:
+                DispatchQueue.main.async {
+                    self.meetingWsRetryTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+                        self?.connectMeetingEventsWebSocket()
+                    }
                 }
             }
-        }.resume()
+        }
+    }
+
+    private func processMeetingEventMessage(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        let active = payload["active"] as? Bool ?? false
+        setMeetingActive(active)
+    }
+
+    func setMeetingActive(_ active: Bool) {
+        DispatchQueue.main.async { [self] in
+            if self.metrics.meetingActive != active {
+                self.metrics.meetingActive = active
+                self.updateContent()
+            }
+        }
     }
 
     private func parseShortcuts(_ json: String) {
@@ -511,7 +547,7 @@ class ShortcutReminderController: NSObject {
         if let s = dict["chat"] { chatShortcut = prettifyShortcut(s) }
         if let s = dict["search"] { searchShortcut = prettifyShortcut(s) }
         if let s = dict["metrics_ws_url"] { metricsWsUrl = s }
-        if let s = dict["meetings_status_url"] { meetingsStatusUrl = s }
+        if let s = dict["events_ws_url"] { eventsWsUrl = s }
     }
 
     /// Convert "Super+Ctrl+S" → "⌘⌃S" for compact overlay display.

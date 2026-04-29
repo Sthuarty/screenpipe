@@ -1928,11 +1928,14 @@ export function PipesSection() {
                   </DropdownMenu>
                 </div>
 
-                {/* Toggle — only visible on hover */}
+                {/* Toggle — only visible on hover.
+                    Missing connections block ENABLING (can't run), but never
+                    block DISABLING — a stuck-on pipe with broken deps must
+                    always be turn-off-able. */}
                 <div
                   className="opacity-0 group-hover:opacity-100 transition-opacity"
                   title={
-                    hasMissingConnections
+                    hasMissingConnections && !pipe.config.enabled
                       ? "configure required connections before enabling auto-run"
                       : pipe.config.enabled
                         ? "auto-running on schedule — click to disable"
@@ -1941,7 +1944,7 @@ export function PipesSection() {
                 >
                   <Switch
                     checked={pipe.config.enabled}
-                    disabled={hasMissingConnections}
+                    disabled={hasMissingConnections && !pipe.config.enabled}
                     onCheckedChange={(checked) =>
                       togglePipe(pipe.config.name, checked)
                     }

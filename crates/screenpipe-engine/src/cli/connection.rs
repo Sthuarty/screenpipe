@@ -101,11 +101,7 @@ pub async fn handle_connection_command(command: &ConnectionCommand) -> anyhow::R
                     connected: b.ready,
                 });
             }
-            rows.sort_by(|a, b| {
-                b.connected
-                    .cmp(&a.connected)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            rows.sort_by(|a, b| b.connected.cmp(&a.connected).then_with(|| a.id.cmp(&b.id)));
 
             if *use_json {
                 let items: Vec<Value> = rows
@@ -198,7 +194,11 @@ pub async fn handle_connection_command(command: &ConnectionCommand) -> anyhow::R
                 if *use_json {
                     println!("{}", serde_json::to_string_pretty(&info)?);
                 } else {
-                    let status = if b.ready { "connected" } else { "not connected" };
+                    let status = if b.ready {
+                        "connected"
+                    } else {
+                        "not connected"
+                    };
                     println!("{}: {}", b.id, status);
                     println!("\n{}", b.description);
                 }

@@ -31,7 +31,7 @@ import { VideoComponent } from "@/components/rewind/video";
 import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
-import { AIPreset } from "@/lib/utils/tauri";
+import { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 // OpenAI SDK no longer used directly — all providers route through Pi agent
@@ -1330,6 +1330,11 @@ export function StandaloneChat({
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamedCharCount, setStreamedCharCount] = useState(0);
+  // Prompts the user has queued while a previous one is still streaming.
+  // Sourced from rust via the `pi-queue-changed` event — single source of
+  // truth lives in `pi_command_queue.rs`. Cleared as soon as the drain loop
+  // pulls a queued item and writes it to stdin (it's then in-flight).
+  const [queuedPrompts, setQueuedPrompts] = useState<PiQueuedPrompt[]>([]);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
   // Cursor-style inline edit: click a sent user message to tweak and resend
@@ -2281,10 +2286,13 @@ export function StandaloneChat({
       return;
     }
 
-    // Enter without shift submits the form
+    // Enter without shift submits the form. We intentionally don't gate on
+    // isLoading anymore — if a previous prompt is still streaming, the new
+    // one is enqueued at the rust level (see `pi_command_queue.rs`) and
+    // shown in the queued-cards rail under the transcript.
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
-      if ((input.trim() || pastedImages.length > 0) && !isLoading) {
+      if (input.trim() || pastedImages.length > 0) {
         sendMessage(input.trim());
       }
       return;
@@ -2562,12 +2570,71 @@ export function StandaloneChat({
     // uniformly.
     const busUnregistrations: Array<() => void> = [];
 
-    // Shared handler for Pi event data — used by both pi_event and pipe_event
+    // Shared handler for Pi event data — used by both pi_event and pipe_event.
+    //
+    // When the rust queue drains a queued prompt, Pi emits text_delta /
+    // thinking_start / tool_execution_start for a NEW turn — but the previous
+    // turn's `agent_end` cleared `piMessageIdRef`, so deltas have no target.
+    // `ensureAssistantPlaceholder` lazily creates one when the trailing message
+    // is a user prompt waiting for a reply (the shape `enqueuePiMessage`
+    // leaves the array in). Idempotent — does nothing when a placeholder
+    // already exists.
+    const ensureAssistantPlaceholder = (): boolean => {
+      if (piMessageIdRef.current) return true;
+      const newAssistantId = (Date.now() + 1).toString();
+      let created = false;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== "user") return prev;
+        created = true;
+        return [
+          ...prev,
+          {
+            id: newAssistantId,
+            role: "assistant",
+            content: "Processing...",
+            timestamp: Date.now(),
+            model: activePreset?.model,
+            provider: activePreset?.provider,
+          },
+        ];
+      });
+      if (!created) return false;
+      piMessageIdRef.current = newAssistantId;
+      piStreamingTextRef.current = "";
+      piContentBlocksRef.current = [];
+      setStreamedCharCount(0);
+      setIsLoading(true);
+      setIsStreaming(true);
+      const sidNow = piSessionIdRef.current;
+      if (sidNow) {
+        const storeState = useChatStore.getState();
+        storeState.actions.appendMessage(sidNow, {
+          id: newAssistantId,
+          role: "assistant",
+          content: "Processing...",
+          timestamp: Date.now(),
+          model: activePreset?.model,
+          provider: activePreset?.provider,
+        } as any);
+        storeState.actions.setStreaming(sidNow, {
+          streamingMessageId: newAssistantId,
+          streamingText: "",
+          contentBlocks: [],
+          isStreaming: true,
+          isLoading: true,
+        });
+      }
+      return true;
+    };
+
     const handlePiEventData = (data: any) => {
 
         if (data.type === "message_update" && data.assistantMessageEvent) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
+            // First delta of a queued turn → create the placeholder lazily.
+            if (!ensureAssistantPlaceholder()) return;
             piStreamingTextRef.current += evt.delta;
             setStreamedCharCount(piStreamingTextRef.current.length);
 
@@ -2601,6 +2668,7 @@ export function StandaloneChat({
               );
             }
           } else if (evt.type === "thinking_start") {
+            if (!ensureAssistantPlaceholder()) return;
             piThinkingStartRef.current = Date.now();
             const blocks = piContentBlocksRef.current;
             blocks.push({ type: "thinking", text: "", isThinking: true });
@@ -2642,6 +2710,7 @@ export function StandaloneChat({
             }
           }
         } else if (data.type === "tool_execution_start") {
+          if (!ensureAssistantPlaceholder()) return;
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
             const toolCall: ToolCall = {
@@ -3167,6 +3236,25 @@ export function StandaloneChat({
 
     setup();
 
+    // Subscribe to queue-pending updates emitted by the rust queue. Each
+    // event carries the full snapshot for ONE session — we filter to the
+    // session this panel is bound to. Single source of truth lives in
+    // `pi_command_queue.rs`; this listener just mirrors it into local state.
+    let unlistenQueue: UnlistenFn | undefined;
+    listen<{ sessionId: string; queued: PiQueuedPrompt[] }>("pi-queue-changed", (event) => {
+      if (!mounted) return;
+      if (event.payload.sessionId !== piSessionIdRef.current) return;
+      setQueuedPrompts(event.payload.queued ?? []);
+    }).then(fn => { unlistenQueue = fn; });
+
+    // Initial fetch — closes the gap between component mount and first event.
+    (async () => {
+      try {
+        const res = await commands.piPending(piSessionIdRef.current);
+        if (mounted && res.status === "ok") setQueuedPrompts(res.data);
+      } catch { /* ignore — queue may not be initialized yet */ }
+    })();
+
     // Restart the current session when a new auth token arrives (deeplink login).
     listen<{ apiKey: string }>("pi-reauth", async (event) => {
       if (!mounted) return;
@@ -3190,6 +3278,7 @@ export function StandaloneChat({
       }
       unlistenLog?.();
       unlistenReauth?.();
+      unlistenQueue?.();
       // Abort any in-flight Pi request when navigating away from chat.
       // Without this, Pi keeps streaming in the background and rejects
       // new messages with "already processing" when the user returns.
@@ -3440,6 +3529,96 @@ export function StandaloneChat({
   }
 
   // Send message using Pi agent
+  /**
+   * Enqueue a follow-up while another prompt is still streaming.
+   *
+   * Distinct from `sendPiMessage` because we explicitly want to NOT:
+   *   - abort the in-flight turn,
+   *   - clobber `piMessageIdRef` / streaming refs,
+   *   - flip `isLoading`/`isStreaming`.
+   *
+   * The rust queue (`pi_command_queue.rs`) holds the prompt until the current
+   * turn's `agent_end` fires, then writes it to stdin. The pi-event-router
+   * downstream picks up the new turn and appends user/assistant content to
+   * the chat-store — same path used for any other message, just kicked off
+   * after the queue drains.
+   */
+  async function enqueuePiMessage(userMessage: string, displayLabel?: string) {
+    if (!piInfo?.running) {
+      // No Pi running → fall back to the normal start-and-send path.
+      return sendPiMessage(userMessage, displayLabel);
+    }
+
+    // Local optimistic message + chat-store mirror. Skips assistant placeholder
+    // entirely; the new turn's `agent_start` (downstream from the rust queue
+    // dequeue) will create one through the existing event flow.
+    const newUserMessage: Message = {
+      id: Date.now().toString(),
+      role: "user",
+      content: userMessage,
+      ...(displayLabel ? { displayContent: displayLabel } : {}),
+      ...(pastedImages.length > 0 ? { images: [...pastedImages] } : {}),
+      timestamp: Date.now(),
+    };
+    setMessages((prev) => [...prev, newUserMessage]);
+    setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
+
+    const sidNow = piSessionIdRef.current;
+    if (sidNow) {
+      const storeState = useChatStore.getState();
+      if (!storeState.sessions[sidNow]) {
+        storeState.actions.upsert({
+          id: sidNow,
+          title: "new chat",
+          preview: "",
+          status: "streaming",
+          messageCount: 0,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          unread: false,
+        });
+      }
+      storeState.actions.appendMessage(sidNow, newUserMessage as any);
+      storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
+    }
+
+    // Persist immediately — covers the edge case where Pi crashes between
+    // enqueue and dequeue, leaving the user's message stranded otherwise.
+    void saveConversation([...messages, newUserMessage]);
+
+    posthog.capture("chat_message_enqueued", {
+      provider: activePreset?.provider,
+      model: activePreset?.model,
+      pending_count: queuedPrompts.length + 1,
+    });
+
+    // Convert any data-URL pastes to the Pi image-content shape (same format
+    // used by the normal send path further down in this file).
+    const piImages: Array<{ type: string; mimeType: string; data: string }> = [];
+    for (const img of pastedImages) {
+      const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
+      if (match) {
+        piImages.push({ type: "image", mimeType: match[1], data: match[2] });
+      }
+    }
+    if (pastedImages.length > 0) setPastedImages([]);
+
+    try {
+      const result = await commands.piPrompt(
+        piSessionIdRef.current,
+        userMessage,
+        piImages.length > 0 ? piImages : null,
+      );
+      if (result.status !== "ok") {
+        toast({ title: "failed to queue message", description: result.error, variant: "destructive" });
+      }
+    } catch (e) {
+      console.warn("[Pi] failed to enqueue follow-up:", e);
+    }
+  }
+
   async function sendPiMessage(userMessage: string, displayLabel?: string) {
     // Auto-start Pi if it's not running yet (new session or crash recovery)
     if (!piInfo?.running) {
@@ -3867,6 +4046,16 @@ export function StandaloneChat({
   async function sendMessage(userMessage: string, displayLabel?: string) {
     if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
 
+    // If a previous prompt is still streaming, enqueue this one at the rust
+    // level instead of going through sendPiMessage (which aborts the previous
+    // turn — exactly what we DON'T want when the user is queueing follow-ups).
+    // The rust queue's drain loop will pull this prompt and write it to stdin
+    // as soon as the in-flight prompt's `agent_end` arrives. The pi-event-router
+    // will append the new turn's user + assistant messages to the chat-store.
+    if (isLoading || isStreaming) {
+      return enqueuePiMessage(userMessage, displayLabel);
+    }
+
     // All providers route through Pi agent
     return sendPiMessage(userMessage, displayLabel);
   }
@@ -3931,7 +4120,7 @@ export function StandaloneChat({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!input.trim() && pastedImages.length === 0) || isLoading) return;
+    if (!input.trim() && pastedImages.length === 0) return;
     sendMessage(input.trim());
   };
 
@@ -4516,6 +4705,61 @@ export function StandaloneChat({
             );
           })()}
         </AnimatePresence>
+
+        {/* Queued follow-ups — rendered between the streaming message and the
+            scroll anchor so they sit visually in the "what's next" gap. The
+            list comes from rust via `pi-queue-changed`; entries disappear as
+            the drain loop pulls each prompt and starts streaming it. */}
+        <AnimatePresence>
+          {queuedPrompts.length > 0 && (
+            <motion.div
+              key="queued-rail"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.2 }}
+              className="px-4 py-2 space-y-1.5"
+            >
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground/60 px-1">
+                queued · waiting for current reply
+              </div>
+              {queuedPrompts.map((p, i) => (
+                <motion.div
+                  key={p.id}
+                  layout
+                  initial={{ opacity: 0, x: -6 }}
+                  animate={{ opacity: 0.85, x: 0 }}
+                  exit={{ opacity: 0, x: 6, scale: 0.96 }}
+                  transition={{ duration: 0.18 }}
+                  className="group/qcard flex items-center gap-2 px-3 py-2 rounded-md border border-dashed border-border/60 bg-muted/30 text-sm text-muted-foreground hover:border-border hover:bg-muted/50 transition-colors"
+                  title={p.preview.length > 80 ? p.preview : undefined}
+                >
+                  <span className="font-mono text-[10px] text-muted-foreground/50 shrink-0 w-4 text-right">
+                    {i + 1}
+                  </span>
+                  <Clock className="h-3 w-3 flex-shrink-0 opacity-50" />
+                  <span className="truncate flex-1">{p.preview}</span>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await commands.piCancelQueued(piSessionIdRef.current, p.id);
+                      } catch (e) {
+                        console.warn("[Pi] cancel queued failed:", e);
+                      }
+                    }}
+                    className="opacity-0 group-hover/qcard:opacity-100 transition-opacity p-0.5 hover:bg-muted rounded shrink-0"
+                    aria-label="cancel queued message"
+                    title="cancel"
+                  >
+                    <X className="h-3 w-3 text-muted-foreground" />
+                  </button>
+                </motion.div>
+              ))}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         <div ref={messagesEndRef} />
       </div> {/* End of max-w-4xl wrapper */}
 
@@ -4963,7 +5207,9 @@ export function StandaloneChat({
                 placeholder={
                   disabledReason
                     ? disabledReason
-                    : "Ask about your screen... (type @ for filters, paste images)"
+                    : isLoading || isStreaming
+                      ? "type to queue next message..."
+                      : "Ask about your screen... (type @ for filters, paste images)"
                 }
                 disabled={!canChat}
                 spellCheck={false}
@@ -5112,24 +5358,47 @@ export function StandaloneChat({
               >
                 <Paperclip className="h-4 w-4" />
               </Button>
-              <Button
-                type={isStreaming ? "button" : "submit"}
-                size="icon"
-                disabled={(!input.trim() && !isStreaming && pastedImages.length === 0) || !canChat}
-                onClick={isStreaming ? handleStop : undefined}
-                className={cn(
-                  "h-8 w-8 transition-all duration-200",
-                  isStreaming
-                    ? "bg-foreground text-background hover:bg-foreground/80"
-                    : "bg-foreground text-background hover:bg-background hover:text-foreground"
-                )}
-              >
-                {isStreaming ? (
-                  <Square className="h-4 w-4" />
-                ) : (
-                  <Send className="h-4 w-4" />
-                )}
-              </Button>
+              {(() => {
+                // Three button modes:
+                //   1. streaming + input empty → stop (square)
+                //   2. streaming + input has text → queue (chevron-up, submits, enqueues)
+                //   3. not streaming → send (paper plane)
+                const hasInput = input.trim().length > 0 || pastedImages.length > 0;
+                const isQueueMode = (isLoading || isStreaming) && hasInput;
+                const isStopMode = (isLoading || isStreaming) && !hasInput;
+                return (
+                  <Button
+                    type={isStopMode ? "button" : "submit"}
+                    size="icon"
+                    disabled={(!hasInput && !isStopMode) || !canChat}
+                    onClick={isStopMode ? handleStop : undefined}
+                    className={cn(
+                      "h-8 w-8 transition-all duration-200 relative",
+                      "bg-foreground text-background hover:bg-foreground/80"
+                    )}
+                    title={
+                      isStopMode
+                        ? "stop"
+                        : isQueueMode
+                          ? `queue (${queuedPrompts.length + 1} pending)`
+                          : "send"
+                    }
+                  >
+                    {isStopMode ? (
+                      <Square className="h-4 w-4" />
+                    ) : isQueueMode ? (
+                      <ChevronUp className="h-4 w-4" />
+                    ) : (
+                      <Send className="h-4 w-4" />
+                    )}
+                    {isQueueMode && queuedPrompts.length > 0 && (
+                      <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-[16px] px-1 rounded-full bg-foreground text-background text-[9px] font-mono font-semibold flex items-center justify-center border border-background">
+                        {queuedPrompts.length + 1}
+                      </span>
+                    )}
+                  </Button>
+                );
+              })()}
             </div>
           </div>
         </form>

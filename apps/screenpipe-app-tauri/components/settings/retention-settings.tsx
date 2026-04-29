@@ -5,7 +5,6 @@
 
 import React, { useEffect, useState, useCallback } from "react";
 import { useSettings } from "@/lib/hooks/use-settings";
-import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -15,7 +14,14 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
-import { Trash2, Loader2, Play, AlertTriangle } from "lucide-react";
+import {
+  Trash2,
+  Loader2,
+  Play,
+  AlertTriangle,
+  Clock,
+  Film,
+} from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -28,9 +34,13 @@ import {
 } from "@/components/ui/alert-dialog";
 import { localFetch } from "@/lib/api";
 
+type RetentionMode = "media" | "all";
+type EffectiveMode = "off" | RetentionMode;
+
 interface RetentionStatus {
   enabled: boolean;
   retention_days: number;
+  mode?: RetentionMode;
   last_cleanup: string | null;
   last_error: string | null;
   total_deleted: number;
@@ -42,6 +52,12 @@ const RETENTION_OPTIONS = [
   { value: "30", label: "30 days" },
   { value: "60", label: "60 days" },
   { value: "90", label: "90 days" },
+];
+
+const RECENT_DELETE_OPTIONS = [
+  { minutes: 15, label: "last 15 min" },
+  { minutes: 30, label: "last 30 min" },
+  { minutes: 60, label: "last hour" },
 ];
 
 function formatRelativeTime(isoString: string): string {
@@ -57,16 +73,33 @@ function formatRelativeTime(isoString: string): string {
   return `${diffDays}d ago`;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 export function RetentionSettings() {
   const { settings, updateSettings } = useSettings();
   const { toast } = useToast();
   const [status, setStatus] = useState<RetentionStatus | null>(null);
-  const [toggling, setToggling] = useState(false);
   const [running, setRunning] = useState(false);
-  const [showConfirm, setShowConfirm] = useState(false);
+  const [pendingMode, setPendingMode] = useState<RetentionMode | null>(null);
+  const [preview, setPreview] = useState<{
+    file_count: number;
+    bytes: number;
+  } | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [pendingRecent, setPendingRecent] = useState<number | null>(null);
+  const [deletingRecent, setDeletingRecent] = useState(false);
 
   const enabled = settings.localRetentionEnabled ?? false;
   const retentionDays = settings.localRetentionDays ?? 14;
+  const mode: RetentionMode =
+    (settings.localRetentionMode as RetentionMode | undefined) ?? "media";
+  const effective: EffectiveMode = enabled ? mode : "off";
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -85,97 +118,169 @@ export function RetentionSettings() {
     return () => clearInterval(interval);
   }, [fetchStatus]);
 
-  const handleToggle = async (wantEnabled: boolean) => {
-    if (wantEnabled) {
-      setShowConfirm(true);
+  // Pull a fresh disk-preview whenever a confirmation opens or retentionDays
+  // changes while pending. Cheap query, no debounce needed at human pace.
+  useEffect(() => {
+    if (pendingMode === null) {
+      setPreview(null);
       return;
     }
-
-    setToggling(true);
-    try {
-      const res = await localFetch("/retention/configure", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: false }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "failed to disable retention");
+    let cancelled = false;
+    setPreviewLoading(true);
+    (async () => {
+      try {
+        const res = await localFetch(
+          `/data/storage-preview?older_than_days=${retentionDays}`,
+        );
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        const data = await res.json();
+        if (!cancelled) setPreview(data);
+      } catch {
+        if (!cancelled) setPreview(null);
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
       }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingMode, retentionDays]);
 
-      await updateSettings({ localRetentionEnabled: false });
-      toast({ title: "auto-delete disabled" });
-      fetchStatus();
-    } catch (e: any) {
-      toast({
-        title: "failed to disable auto-delete",
-        description: e.message,
-        variant: "destructive",
-      });
-    } finally {
-      setToggling(false);
+  const applyConfig = async (next: {
+    enabled: boolean;
+    mode?: RetentionMode;
+    retention_days?: number;
+  }) => {
+    const body: Record<string, unknown> = { enabled: next.enabled };
+    if (next.mode !== undefined) body.mode = next.mode;
+    if (next.retention_days !== undefined)
+      body.retention_days = next.retention_days;
+    const res = await localFetch("/retention/configure", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `request failed (${res.status})`);
     }
   };
 
-  const confirmEnable = async () => {
-    setShowConfirm(false);
-    setToggling(true);
-    try {
-      const res = await localFetch("/retention/configure", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: true, retention_days: retentionDays }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "failed to enable retention");
+  const handleSelectMode = async (next: EffectiveMode) => {
+    if (next === effective) return;
+    if (next === "off") {
+      try {
+        await applyConfig({ enabled: false });
+        await updateSettings({ localRetentionEnabled: false });
+        toast({ title: "auto-delete disabled" });
+        fetchStatus();
+      } catch (e: any) {
+        toast({
+          title: "failed to disable auto-delete",
+          description: e.message,
+          variant: "destructive",
+        });
       }
+      return;
+    }
+    // Enabling or switching mode → confirm
+    setPendingMode(next);
+  };
 
-      await updateSettings({ localRetentionEnabled: true });
-      toast({ title: `auto-delete enabled (${retentionDays}d retention)` });
+  const confirmEnable = async () => {
+    if (pendingMode === null) return;
+    const nextMode = pendingMode;
+    setPendingMode(null);
+    try {
+      await applyConfig({
+        enabled: true,
+        mode: nextMode,
+        retention_days: retentionDays,
+      });
+      await updateSettings({
+        localRetentionEnabled: true,
+        localRetentionMode: nextMode,
+      });
+      toast({
+        title:
+          nextMode === "media"
+            ? `media eviction enabled (${retentionDays}d)`
+            : `auto-delete enabled (${retentionDays}d)`,
+      });
       fetchStatus();
     } catch (e: any) {
       toast({
-        title: "failed to enable auto-delete",
+        title: "failed to update retention",
         description: e.message,
         variant: "destructive",
       });
-    } finally {
-      setToggling(false);
     }
   };
 
   const handleRetentionChange = async (value: string) => {
     const days = parseInt(value, 10);
     await updateSettings({ localRetentionDays: days });
-
     if (enabled) {
       try {
-        await localFetch("/retention/configure", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ retention_days: days }),
-        });
+        await applyConfig({ enabled: true, retention_days: days });
       } catch {
         // non-critical
       }
     }
   };
 
+  const confirmDeleteRecent = async () => {
+    if (pendingRecent === null) return;
+    const minutes = pendingRecent;
+    setPendingRecent(null);
+    setDeletingRecent(true);
+    try {
+      const end = new Date();
+      const start = new Date(end.getTime() - minutes * 60_000);
+      const res = await localFetch("/data/delete-range", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          start: start.toISOString(),
+          end: end.toISOString(),
+          local_only: true,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `request failed (${res.status})`);
+      }
+      const r = await res.json();
+      const total =
+        (r.frames_deleted || 0) +
+        (r.audio_transcriptions_deleted || 0) +
+        (r.ui_events_deleted || 0);
+      const files = (r.video_files_deleted || 0) + (r.audio_files_deleted || 0);
+      toast({
+        title: `deleted last ${minutes} min`,
+        description: `${total.toLocaleString()} records, ${files} files removed from disk`,
+      });
+      fetchStatus();
+    } catch (e: any) {
+      toast({
+        title: "failed to delete recent data",
+        description: e.message,
+        variant: "destructive",
+      });
+    } finally {
+      setDeletingRecent(false);
+    }
+  };
+
   const handleRunNow = async () => {
     setRunning(true);
     try {
-      const res = await localFetch("/retention/run", {
-        method: "POST",
-      });
+      const res = await localFetch("/retention/run", { method: "POST" });
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || "failed to trigger cleanup");
       }
       toast({ title: "cleanup triggered" });
-      // poll status after a short delay
       setTimeout(fetchStatus, 3000);
     } catch (e: any) {
       toast({
@@ -191,101 +296,268 @@ export function RetentionSettings() {
   return (
     <>
       <div className="space-y-4 pt-4 border-t border-border">
-        <div className="flex items-center justify-between">
+        {/* Recent-window delete */}
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Clock className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-sm font-medium">delete recent data</p>
+              <p className="text-xs text-muted-foreground">
+                instantly purge everything captured in the chosen window
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 pl-6">
+            {RECENT_DELETE_OPTIONS.map((opt) => (
+              <Button
+                key={opt.minutes}
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                onClick={() => setPendingRecent(opt.minutes)}
+                disabled={deletingRecent}
+              >
+                {opt.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+
+        {/* Auto-cleanup section */}
+        <div className="space-y-3 pt-3 border-t border-border/50">
           <div className="flex items-center gap-2">
             <Trash2 className="h-4 w-4 text-muted-foreground" />
             <div>
               <p className="text-sm font-medium">auto-delete old data</p>
               <p className="text-xs text-muted-foreground">
-                permanently delete recordings older than the retention period
+                free disk space without losing your timeline
               </p>
             </div>
           </div>
-          <Switch
-            checked={enabled}
-            onCheckedChange={handleToggle}
-            disabled={toggling}
-          />
-        </div>
 
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-muted-foreground">keep data for</span>
-          <Select
-            value={retentionDays.toString()}
-            onValueChange={handleRetentionChange}
-          >
-            <SelectTrigger className="w-[120px] h-8">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {RETENTION_OPTIONS.map((opt) => (
-                <SelectItem key={opt.value} value={opt.value}>
-                  {opt.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="space-y-2 pl-6">
+            <ModeRow
+              checked={effective === "media"}
+              recommended
+              icon={<Film className="h-4 w-4" />}
+              title="video + audio only"
+              body="reclaims mp4/wav/jpeg files. transcripts, ocr, app history stay searchable. you won't be able to replay clips past the cutoff."
+              onClick={() => handleSelectMode("media")}
+            />
+            <ModeRow
+              checked={effective === "all"}
+              icon={<Trash2 className="h-4 w-4" />}
+              title="everything"
+              body="permanently deletes all data past the cutoff. search won't find anything from that period."
+              onClick={() => handleSelectMode("all")}
+            />
+            <ModeRow
+              checked={effective === "off"}
+              title="off"
+              body="keep everything forever. you'll need to monitor disk usage manually."
+              onClick={() => handleSelectMode("off")}
+            />
+          </div>
 
-          {enabled && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8 text-xs"
-              onClick={handleRunNow}
-              disabled={running}
-            >
-              {running ? (
-                <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
-              ) : (
-                <Play className="h-3 w-3 mr-1.5" />
+          {effective !== "off" && (
+            <div className="flex items-center gap-3 pl-6">
+              <span className="text-sm text-muted-foreground">
+                {effective === "media" ? "evict media older than" : "delete data older than"}
+              </span>
+              <Select
+                value={retentionDays.toString()}
+                onValueChange={handleRetentionChange}
+              >
+                <SelectTrigger className="w-[120px] h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {RETENTION_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                onClick={handleRunNow}
+                disabled={running}
+              >
+                {running ? (
+                  <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+                ) : (
+                  <Play className="h-3 w-3 mr-1.5" />
+                )}
+                clean up now
+              </Button>
+            </div>
+          )}
+
+          {effective !== "off" && status && (
+            <div className="text-xs text-muted-foreground space-y-1 pl-6">
+              {status.last_cleanup && (
+                <p>last cleanup: {formatRelativeTime(status.last_cleanup)}</p>
               )}
-              clean up now
-            </Button>
+              {status.total_deleted > 0 && (
+                <p>
+                  total {effective === "media" ? "files evicted" : "records deleted"}:{" "}
+                  {status.total_deleted.toLocaleString()}
+                </p>
+              )}
+              {status.last_error && (
+                <p className="text-destructive flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3" />
+                  {status.last_error}
+                </p>
+              )}
+            </div>
           )}
         </div>
-
-        {/* Status */}
-        {enabled && status && (
-          <div className="text-xs text-muted-foreground space-y-1">
-            {status.last_cleanup && (
-              <p>last cleanup: {formatRelativeTime(status.last_cleanup)}</p>
-            )}
-            {status.total_deleted > 0 && (
-              <p>total records deleted: {status.total_deleted.toLocaleString()}</p>
-            )}
-            {status.last_error && (
-              <p className="text-destructive flex items-center gap-1">
-                <AlertTriangle className="h-3 w-3" />
-                {status.last_error}
-              </p>
-            )}
-          </div>
-        )}
-
-        <p className="text-xs text-muted-foreground/70">
-          this permanently deletes data from your device. use cloud archive if
-          you want to keep a backup.
-        </p>
       </div>
 
-      <AlertDialog open={showConfirm} onOpenChange={setShowConfirm}>
+      {/* Recent-delete confirmation */}
+      <AlertDialog
+        open={pendingRecent !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingRecent(null);
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>enable auto-delete?</AlertDialogTitle>
+            <AlertDialogTitle>
+              delete the last {pendingRecent} minutes?
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              data older than {retentionDays} days will be permanently deleted
-              from your device. this includes screen recordings, audio, and
-              transcriptions. this cannot be undone.
+              this permanently removes every screen recording, audio segment,
+              transcription, and ocr capture from the last {pendingRecent}{" "}
+              minutes. files are also deleted from disk. this cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmEnable}>
-              enable auto-delete
+            <AlertDialogAction
+              onClick={confirmDeleteRecent}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              delete {pendingRecent} min of data
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Mode-change confirmation */}
+      <AlertDialog
+        open={pendingMode !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingMode(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {pendingMode === "media"
+                ? "enable media eviction?"
+                : "delete everything past the cutoff?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingMode === "media" ? (
+                <>
+                  every day, screenpipe will delete video and audio files older
+                  than {retentionDays} days. transcripts, ocr text, and your
+                  app/window timeline stay searchable.
+                </>
+              ) : (
+                <>
+                  every day, screenpipe will permanently delete <em>all</em>{" "}
+                  data older than {retentionDays} days — recordings,
+                  transcripts, ocr, ui events. search won't find anything past
+                  that. this cannot be undone.
+                </>
+              )}
+              <span className="block mt-3 text-xs">
+                {previewLoading ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    estimating disk space...
+                  </span>
+                ) : preview && preview.bytes > 0 ? (
+                  <>
+                    on your device this would currently free{" "}
+                    <strong>{formatBytes(preview.bytes)}</strong> across{" "}
+                    {preview.file_count.toLocaleString()} files.
+                  </>
+                ) : preview ? (
+                  <>nothing past the cutoff right now — first cleanup will run when data ages in.</>
+                ) : null}
+              </span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmEnable}
+              className={
+                pendingMode === "all"
+                  ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  : undefined
+              }
+            >
+              {pendingMode === "media" ? "enable eviction" : "enable deletion"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </>
+  );
+}
+
+function ModeRow({
+  checked,
+  title,
+  body,
+  recommended,
+  icon,
+  onClick,
+}: {
+  checked: boolean;
+  title: string;
+  body: string;
+  recommended?: boolean;
+  icon?: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full text-left flex gap-3 rounded border p-2.5 transition-colors ${
+        checked
+          ? "border-foreground/40 bg-muted/40"
+          : "border-border hover:border-foreground/20 hover:bg-muted/20"
+      }`}
+    >
+      <span
+        className={`mt-0.5 h-3.5 w-3.5 shrink-0 rounded-full border ${
+          checked
+            ? "border-foreground bg-foreground"
+            : "border-muted-foreground"
+        }`}
+      />
+      <div className="flex-1 space-y-0.5">
+        <div className="flex items-center gap-1.5 text-sm font-medium">
+          {icon}
+          <span>{title}</span>
+          {recommended && (
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground border border-border rounded px-1 py-px ml-1">
+              recommended
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">{body}</p>
+      </div>
+    </button>
   );
 }

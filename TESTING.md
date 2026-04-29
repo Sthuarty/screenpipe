@@ -78,6 +78,7 @@ commits that broke this area: `0752ea59`, `7562ec62`, `2a2bd9b5`, `f2f7f770`, `5
 - [ ] **dock right-click menu works** — right-click dock icon. "Show screenpipe", "Settings", "Check for updates" all work (`d794176a`).
 - [ ] **tray menu items don't fire twice** — click any tray menu item. action happens once, not twice (`9e151265`).
 - [ ] **tray health indicator** — tray icon shows green (healthy) or yellow/red (issues) based on recording status.
+- [ ] **tray doesn't show false "Error" on transient issues** — Under load (running many pipes, high CPU), tray icon should not flip to "Error" if recording is actually working. Only sustained errors (>2min) show red. Tests under transient DB/OCR/audio pressure. (`abc234aae`)
 - [ ] **tray on notched MacBook** — on 14"/16" MacBook Pro, tray icon is visible (not hidden behind notch). if hidden, user can Cmd+drag to reposition.
 - [ ] **activation policy never changes** — after ANY user interaction, dock icon should remain visible. no Accessory mode switches. verify with: `ps aux | grep screenpipe`.
 - [ ] **no autosave_name crash** — removed in `2a2bd9b5`. objc2→objc pointer cast was causing `panic_cannot_unwind`.

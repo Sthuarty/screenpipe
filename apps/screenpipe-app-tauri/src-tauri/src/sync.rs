@@ -731,11 +731,13 @@ pub async fn auto_start_retention(app: &AppHandle) {
         _ => return,
     };
 
+    // Default to enabled+media for users on stores that haven't seen the
+    // setting yet — matches the default in createDefaultSettingsObject.
     let enabled = settings
         .extra
         .get("localRetentionEnabled")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if !enabled {
         return;
@@ -747,11 +749,19 @@ pub async fn auto_start_retention(app: &AppHandle) {
         .and_then(|v| v.as_u64())
         .unwrap_or(14) as u32;
 
+    let mode = settings
+        .extra
+        .get("localRetentionMode")
+        .and_then(|v| v.as_str())
+        .filter(|s| *s == "media" || *s == "all")
+        .unwrap_or("media");
+
     let client = reqwest::Client::new();
     let api = local_api_context_from_app(app);
     let configure_req = serde_json::json!({
         "enabled": true,
         "retention_days": days,
+        "mode": mode,
     });
 
     match apply_local_api_auth(&api, client.post(api.url("/retention/configure")))
@@ -760,7 +770,10 @@ pub async fn auto_start_retention(app: &AppHandle) {
         .await
     {
         Ok(response) if response.status().is_success() => {
-            info!("local retention auto-started (retention={}d)", days);
+            info!(
+                "local retention auto-started (retention={}d, mode={})",
+                days, mode
+            );
         }
         Ok(response) => {
             let status = response.status();

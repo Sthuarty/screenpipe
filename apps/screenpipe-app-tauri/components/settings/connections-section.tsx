@@ -1668,7 +1668,33 @@ export function ConnectionsSection() {
           }
           return <ApiIntegrationPanel integration={selectedIntegration} onRefresh={fetchIntegrations} />;
         }
-        return null;
+        // Fall-through: hardcoded tile but the API hasn't returned (or returned without
+        // this id). Without this branch the panel renders a blank card with just the
+        // icon + close button. Show loading or a retry instead.
+        if (!integrationsLoaded) {
+          return (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              loading connection...
+            </div>
+          );
+        }
+        return (
+          <div className="space-y-2">
+            <p className="text-xs text-muted-foreground">
+              couldn&apos;t load connection metadata. the local screenpipe server may be starting up.
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs gap-1.5 normal-case font-sans tracking-normal"
+              onClick={() => { apiCache.invalidate("connections/list"); fetchIntegrations(); }}
+            >
+              <Loader2 className="h-3 w-3" />
+              retry
+            </Button>
+          </div>
+        );
     }
   };
 

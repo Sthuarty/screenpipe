@@ -8,7 +8,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel only on PR re-pushes; main runs always finish (this job takes
+  # longer than the typical gap between commits, so cancel-in-progress
+  # on main meant 100% of recent runs got cancelled before producing
+  # any signal).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1

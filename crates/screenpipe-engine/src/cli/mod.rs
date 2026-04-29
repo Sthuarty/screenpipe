@@ -416,6 +416,13 @@ pub struct RecordArgs {
     /// Set to 0 to disable retention (keep data forever).
     #[arg(long, default_value_t = 14)]
     pub retention_days: u32,
+
+    /// What gets cleaned up past the retention cutoff.
+    /// `media` (default) reclaims mp4/wav/jpeg files but keeps transcripts,
+    /// ocr text, and the timeline searchable. `all` permanently deletes
+    /// everything (legacy behavior).
+    #[arg(long, value_enum, default_value_t = crate::retention::RetentionMode::Media)]
+    pub retention_mode: crate::retention::RetentionMode,
 }
 
 impl RecordArgs {
