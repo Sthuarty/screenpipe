@@ -1167,6 +1167,16 @@ async fn main() {
             }
             let app_handle = app.handle();
 
+            // Eagerly start the GitHub Copilot proxy so its base_url + api_key
+            // are persisted to ~/.screenpipe/copilot-proxy.json before any
+            // pipe with a github-copilot preset starts. The pipe runner in
+            // screenpipe-core reads that file to dispatch through the proxy.
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = github_copilot_proxy::ensure_started().await {
+                    tracing::warn!("github copilot proxy eager start failed: {}", e);
+                }
+            });
+
             // Create macOS app menu with Settings
             #[cfg(target_os = "macos")]
             {

@@ -130,6 +130,15 @@ async fn start_proxy() -> Result<(), String> {
         addr
     );
 
+    // Persist proxy info to disk so out-of-process consumers (e.g. the pipe
+    // runner in screenpipe-core) can resolve a github-copilot preset to a
+    // working OpenAI-compatible base_url + bearer token without depending on
+    // this app crate. The file is rewritten on every app start because the
+    // port and auth token are regenerated each run.
+    if let Err(e) = persist_proxy_info(&info) {
+        warn!("failed to persist copilot proxy info: {}", e);
+    }
+
     let _ = PROXY.set(info);
 
     let server = axum::Server::from_tcp(std_listener)
@@ -311,4 +320,30 @@ fn upstream_error(status: StatusCode, message: &str) -> Response {
 #[specta::specta]
 pub async fn github_copilot_proxy_info() -> Result<ProxyInfo, String> {
     ensure_started().await
+}
+
+/// Path of the on-disk proxy info file.
+/// Sibling of `store.bin`. The pipe runner in `screenpipe-core` reads this
+/// to translate `provider="github-copilot"` presets into an openai-compatible
+/// `custom` provider call.
+fn proxy_info_path() -> std::path::PathBuf {
+    screenpipe_core::paths::default_screenpipe_data_dir().join("copilot-proxy.json")
+}
+
+fn persist_proxy_info(info: &ProxyInfo) -> std::io::Result<()> {
+    let path = proxy_info_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(info)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, json)?;
+    // Restrict permissions — file contains a bearer token granting access
+    // to the user's Copilot subscription via the local proxy.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
