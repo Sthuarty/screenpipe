@@ -238,8 +238,17 @@ pub async fn reveal_in_default_browser(path: String) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
+        // explorer /select, requires native Windows separators. A path with
+        // forward slashes (e.g. C:/Users/x/foo.md) is silently interpreted
+        // as no path and Explorer opens the Desktop default. Notification
+        // bodies and pipes commonly carry forward-slash paths because they
+        // round-trip cleanly through URL encoding — normalize here.
+        let win_path = path.replace('/', "\\");
+        // /select, must be glued to the path as a single argv token to
+        // survive Windows' command-line quoting rules; passing them as
+        // separate args makes explorer drop the selection target.
         Command::new("explorer")
-            .args(["/select,", &path])
+            .arg(format!("/select,{}", win_path))
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .spawn()
             .map(|_| ())

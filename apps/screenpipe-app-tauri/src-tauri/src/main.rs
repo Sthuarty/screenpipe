@@ -1046,6 +1046,7 @@ async fn main() {
             commands::copy_deeplink_to_clipboard,
             commands::copy_text_to_clipboard,
             commands::open_note_path,
+            commands::open_path_in_default_app,
             // In-app file viewer
             viewer::open_viewer_window,
             viewer::read_viewer_file,

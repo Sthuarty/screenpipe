@@ -232,9 +232,12 @@ export default function ViewerPage() {
   const openInDefault = useCallback(async () => {
     if (!path) return;
     try {
-      await invoke("open_note_path", { path });
+      // Use the OS default-app opener (not `open_note_path`), otherwise
+      // .md files get hijacked into Obsidian even when the path is not
+      // inside any vault, which surfaces a "Vault not found" popup.
+      await invoke("open_path_in_default_app", { path });
     } catch (e) {
-      console.error("open_note_path failed:", e);
+      console.error("open_path_in_default_app failed:", e);
     }
   }, [path]);
 

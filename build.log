@@ -1,0 +1,129 @@
+$ tauri build
+        Info Looking up installed tauri packages to check mismatched versions...
+     Running beforeBuildCommand `bun run build`
+$ bun scripts/pre_build.js
+cwd C:\Users\sthua\Projetos\screenpipe\apps\screenpipe-app-tauri\src-tauri
+wget found at: wget
+7z found at: C:\Program Files\7-Zip\7z.exe
+wget found at: wget
+7z found at: C:\Program Files\7-Zip\7z.exe
+OpenBLAS already exists
+Found in standard location: C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT
+VC CRT DLLs copied to vcredist
+
+Commands to build ­ƒö¿:
+bun install
+bun tauri build
+checking bun binary for tauri...
+npm global prefix: C:\Program Files\nodejs
+found bun using system command at: C:\Users\sthua\.bun\bin\bun.exe
+searching bun in these locations:
+- C:\Users\sthua\.bun\bin\bun.exe
+- C:\Users\sthua\.bun\bin\bun.exe
+- C:\Users\sthua\AppData\Local\bun\bun.exe
+- C:\Program Files\bun\bun.exe
+- C:\Program Files (x86)\bun\bun.exe
+- bun.exe
+- C:\Program Files\nodejs\node_modules\bun\bin\bun.exe
+- C:\Program Files\nodejs\bun.exe
+- C:\Program Files\nodejs\bin\bun.exe
+found bun at: C:\Users\sthua\.bun\bin\bun.exe
+copying bun from: C:\Users\sthua\.bun\bin\bun.exe
+copying bun to: C:\Users\sthua\Projetos\screenpipe\apps\screenpipe-app-tauri\src-tauri\bun-x86_64-pc-windows-msvc.exe
+bun binary already exists for tauri.
+$ next build
+   Ôû▓ Next.js 15.1.4
+
+   Creating an optimized production build ...
+ Ô£ô Compiled successfully
+   Skipping linting
+   Checking validity of types ...
+   Collecting page data ...
+   Generating static pages (0/15) ...
+   Generating static pages (3/15) 
+   Generating static pages (7/15) 
+   Generating static pages (11/15) 
+ Ô£ô Generating static pages (15/15)
+   Finalizing page optimization ...
+   Collecting build traces ...
+   Exporting (0/3) ...
+ Ô£ô Exporting (3/3)
+
+Route (app)                              Size     First Load JS
+Ôöî Ôùï /                                    148 B           107 kB
+Ôö£ Ôùï /_not-found                          148 B           107 kB
+Ôö£ Ôùï /chat                                3.81 kB         622 kB
+Ôö£ Ôùï /home                                30 kB           818 kB
+Ôö£ Ôùï /notification-panel                  7.15 kB         224 kB
+Ôö£ Ôùï /onboarding                          23.7 kB         275 kB
+Ôö£ Ôùï /overlay                             17.2 kB         693 kB
+Ôö£ Ôùï /permission-recovery                 2.75 kB         174 kB
+Ôö£ Ôùï /search                              4.18 kB         155 kB
+Ôö£ Ôùï /settings                            239 kB          536 kB
+Ôö£ Ôùï /shortcut-reminder                   5.06 kB         213 kB
+Ôöö Ôùï /viewer                              4.85 kB         397 kB
++ First Load JS shared by all            107 kB
+  Ôö£ chunks/1517-bed9b0f05ee7ade5.js      50.7 kB
+  Ôö£ chunks/4bd1b696-cf1dc00642853db9.js  53 kB
+  Ôöö other shared chunks (total)          2.94 kB
+
+
+Ôùï  (Static)  prerendered as static content
+
+warning: unused import: `warn`
+ --> C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-secrets\src\migration.rs:7:21
+  |
+7 | use tracing::{info, warn};
+  |                     ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `screenpipe-secrets` (lib) generated 1 warning (run `cargo fix --lib -p screenpipe-secrets` to apply 1 suggestion)
+   Compiling screenpipe-core v0.3.304 (C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-core)
+   Compiling screenpipe-connect v0.3.304 (C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-connect)
+   Compiling screenpipe-a11y v0.1.0 (C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-a11y)
+   Compiling screenpipe-audio v0.3.304 (C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-audio)
+   Compiling screenpipe-screen v0.3.304 (C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-screen)
+warning: unused import: `error`
+ --> C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-screen\src\browser_utils\windows.rs:6:22
+  |
+6 | use tracing::{debug, error};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling screenpipe-engine v0.3.304 (C:\Users\sthua\Projetos\screenpipe\crates\screenpipe-engine)
+warning: `screenpipe-screen` (lib) generated 1 warning (run `cargo fix --lib -p screenpipe-screen` to apply 1 suggestion)
+   Compiling screenpipe-app v2.4.109 (C:\Users\sthua\Projetos\screenpipe\apps\screenpipe-app-tauri\src-tauri)
+warning: variable does not need to be mutable
+  --> src\viewer.rs:50:9
+   |
+50 |     let mut builder = WebviewWindowBuilder::new(
+   |         ----^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `get_or_create_key_if_encryption_enabled` is never used
+  --> src\secrets.rs:29:8
+   |
+29 | pub fn get_or_create_key_if_encryption_enabled() -> Option<[u8; 32]> {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `bring_to_front` is never used
+   --> src\windows_overlay.rs:319:8
+    |
+319 | pub fn bring_to_front(window: &WebviewWindow) -> Result<(), String> {
+    |        ^^^^^^^^^^^^^^
+
+warning: `screenpipe-app` (bin "screenpipe-app") generated 3 warnings (run `cargo fix --bin "screenpipe-app" -p screenpipe-app` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 17m 32s
+       Built application at: C:\Users\sthua\Projetos\screenpipe\apps\screenpipe-app-tauri\src-tauri\target\release\screenpipe-app.exe
+        Info Target: x64
+     Running makensis to produce C:\Users\sthua\Projetos\screenpipe\apps\screenpipe-app-tauri\src-tauri\target\release\bundle\nsis\screenpipe - Development_2.4.109_x64-setup.exe
+    Finished 1 bundle at:
+        C:\Users\sthua\Projetos\screenpipe\apps\screenpipe-app-tauri\src-tauri\target\release\bundle\nsis\screenpipe - Development_2.4.109_x64-setup.exe
+
