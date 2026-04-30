@@ -10,6 +10,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import {
   Popover,
   PopoverContent,
@@ -17,6 +18,7 @@ import {
 } from "@/components/ui/popover";
 import { openSettingsWindow } from "@/lib/utils/window";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import { useToast } from "@/components/ui/use-toast";
 
 interface NotificationEntry {
   id: string;
@@ -30,9 +32,38 @@ interface NotificationEntry {
 
 const API_BASE = "http://localhost:11435";
 
+/** Extract `path` from a `screenpipe://view?path=…` deeplink, or null. */
+function viewerPathFromHref(href: string): string | null {
+  if (!href.startsWith("screenpipe://view")) return null;
+  try {
+    const u = new URL(href);
+    return u.searchParams.get("path");
+  } catch {
+    return null;
+  }
+}
+
 async function openNotificationLink(href: string) {
   const raw = href.trim();
   if (!raw) return;
+
+  // screenpipe://view?path=… — open file in the in-app viewer window.
+  const viewerPath = viewerPathFromHref(raw);
+  if (viewerPath) {
+    await invoke("open_viewer_window", { path: viewerPath });
+    return;
+  }
+
+  // Other screenpipe:// deeplinks — route via DeeplinkHandler on the Main
+  // window. Activate the window first and give React ~150ms to mount the
+  // listener, otherwise the emit fires into a handler that hasn't
+  // subscribed yet and the click silently does nothing.
+  if (raw.startsWith("screenpipe://")) {
+    await invoke("show_window_activated", { window: "Main" });
+    await new Promise((r) => setTimeout(r, 150));
+    await emit("deep-link-received", raw);
+    return;
+  }
 
   let localPath: string | null = null;
   if (raw.startsWith("~/")) {
@@ -68,6 +99,7 @@ export function NotificationBell() {
   const [history, setHistory] = useState<NotificationEntry[]>([]);
   const [open, setOpen] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const { toast } = useToast();
 
   const loadHistory = useCallback(async () => {
     try {
@@ -218,6 +250,7 @@ export function NotificationBell() {
                           <div className="text-[10px] text-muted-foreground mt-0.5 line-clamp-2 pl-4 [&_p]:inline [&_strong]:text-foreground [&_a]:underline">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
+                              urlTransform={(url) => url}
                               components={{
                                 a: ({ href, children }) => (
                                   <a
@@ -229,6 +262,11 @@ export function NotificationBell() {
                                         await openNotificationLink(href);
                                       } catch (err) {
                                         console.error("failed to open url:", href, err);
+                                        toast({
+                                          variant: "destructive",
+                                          title: "couldn't open link",
+                                          description: href,
+                                        });
                                       }
                                     }}
                                     style={{ cursor: "pointer", textDecoration: "underline" }}
@@ -267,6 +305,7 @@ export function NotificationBell() {
                         <div className="text-[10px] text-muted-foreground leading-relaxed mb-2 [&_p]:mb-1 [&_p:last-child]:mb-0 [&_strong]:text-foreground [&_code]:bg-muted [&_code]:px-1 [&_code]:text-[9px] [&_ul]:pl-4 [&_ul]:my-0.5 [&_li]:my-0">
                           <ReactMarkdown
                             remarkPlugins={[remarkGfm]}
+                            urlTransform={(url) => url}
                             components={{
                               a: ({ href, children }) => (
                                 <a
@@ -278,6 +317,11 @@ export function NotificationBell() {
                                       await openNotificationLink(href);
                                     } catch (err) {
                                       console.error("failed to open url:", href, err);
+                                      toast({
+                                        variant: "destructive",
+                                        title: "couldn't open link",
+                                        description: href,
+                                      });
                                     }
                                   }}
                                   style={{ cursor: "pointer", textDecoration: "underline" }}

@@ -2357,12 +2357,13 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
-        let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&path));
+        let win_path = path.replace('/', "\\");
+        let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&win_path));
         let mut a = Command::new("cmd");
         a.args(["/C", "start", "", &obsidian_uri]);
         a.creation_flags(0x08000000); // CREATE_NO_WINDOW
         let mut b = Command::new("cmd");
-        b.args(["/C", "start", "", &path]);
+        b.args(["/C", "start", "", &win_path]);
         b.creation_flags(0x08000000); // CREATE_NO_WINDOW
         if a.spawn().is_ok() || b.spawn().is_ok() {
             Ok(())
@@ -2378,6 +2379,51 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
         } else {
             Err(format!("failed to open note path: {}", path))
         }
+    }
+}
+
+/// Open a path in the OS default application — explicitly skipping the
+/// Obsidian preference of `open_note_path`. The viewer's "Open" button uses
+/// this because the file is already being inspected in-app: routing back
+/// through Obsidian launches Obsidian and surfaces a confusing
+/// "Vault not found" error popup whenever the path lives outside any
+/// configured vault (which is almost always for pipe outputs under
+/// `~/.screenpipe/...`).
+#[tauri::command]
+#[specta::specta]
+pub async fn open_path_in_default_app(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to open {}: {}", path, e))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        // Forward-slash paths confuse some shell-associated handlers on
+        // Windows even though `start` itself often tolerates them.
+        // Normalize for safety.
+        let win_path = path.replace('/', "\\");
+        Command::new("cmd")
+            .args(["/C", "start", "", &win_path])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to open {}: {}", path, e))
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        use std::process::Command;
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to open {}: {}", path, e))
     }
 }
 
