@@ -953,6 +953,11 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             "openai-chatgpt" => Some("openai-chatgpt"),
             "anthropic" => Some("anthropic"),
             "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
+            // GitHub Copilot is dispatched through the local OpenAI-compatible
+            // proxy started by the desktop app. We resolve it as `custom`
+            // below (after reading the proxy info file) so the pi-agent calls
+            // the proxy with a stable base_url + bearer token.
+            "github-copilot" => Some("github-copilot"),
             _ => None,
         })
         .map(|s| s.to_string());
@@ -981,6 +986,33 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    // GitHub Copilot: rewrite as a `custom` provider pointing at the local
+    // proxy that the desktop app starts (see `github_copilot_proxy.rs`). The
+    // proxy injects the short-lived Copilot session token + required headers
+    // on every request, so the pipe runner only needs the proxy's base_url
+    // and per-run bearer token.
+    let (provider, url, api_key) = if provider.as_deref() == Some("github-copilot") {
+        match read_copilot_proxy_info(pipes_dir) {
+            Some((proxy_url, proxy_key)) => (
+                Some("custom".to_string()),
+                Some(proxy_url),
+                Some(proxy_key),
+            ),
+            None => {
+                warn!(
+                    "github-copilot preset selected but copilot-proxy.json is missing; \
+                     sign in to GitHub Copilot in the desktop app at least once before \
+                     running this pipe (the proxy is started on app boot)"
+                );
+                // Fall through with provider unset so the run surfaces a clear
+                // error instead of silently hitting screenpipe cloud.
+                (None, None, None)
+            }
+        }
+    } else {
+        (provider, url, api_key)
+    };
+
     Some(ResolvedPreset {
         model,
         provider,
@@ -988,6 +1020,17 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         api_key,
         prompt,
     })
+}
+
+/// Read the GitHub Copilot proxy info written by the desktop app.
+/// Returns `(base_url, api_key)` if the file exists and parses.
+fn read_copilot_proxy_info(pipes_dir: &Path) -> Option<(String, String)> {
+    let path = pipes_dir.parent()?.join("copilot-proxy.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let base_url = v.get("base_url")?.as_str()?.to_string();
+    let api_key = v.get("api_key")?.as_str()?.to_string();
+    Some((base_url, api_key))
 }
 
 // ---------------------------------------------------------------------------

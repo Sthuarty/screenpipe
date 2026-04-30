@@ -42,6 +42,8 @@ use crate::analytics::start_analytics;
 mod calendar;
 mod capture_session;
 mod chatgpt_oauth;
+mod github_copilot_oauth;
+mod github_copilot_proxy;
 #[allow(deprecated)]
 mod commands;
 mod disk_usage;
@@ -788,6 +790,14 @@ async fn main() {
                 chatgpt_oauth::chatgpt_oauth_get_token,
                 chatgpt_oauth::chatgpt_oauth_logout,
                 chatgpt_oauth::chatgpt_oauth_models,
+                // GitHub Copilot OAuth (device flow) commands
+                github_copilot_oauth::github_copilot_oauth_start,
+                github_copilot_oauth::github_copilot_oauth_status,
+                github_copilot_oauth::github_copilot_oauth_get_token,
+                github_copilot_oauth::github_copilot_oauth_models,
+                github_copilot_oauth::github_copilot_chat_test,
+                github_copilot_oauth::github_copilot_oauth_logout,
+                github_copilot_proxy::github_copilot_proxy_info,
                 // Generic OAuth commands (works for any OAuth integration)
                 oauth::oauth_connect,
                 oauth::oauth_cancel,
@@ -833,6 +843,11 @@ async fn main() {
             .typ::<suggestions::Suggestion>()
             .typ::<hardware::HardwareCapability>()
             .typ::<chatgpt_oauth::ChatGptOAuthStatus>()
+            .typ::<github_copilot_oauth::GithubCopilotOAuthStatus>()
+            .typ::<github_copilot_oauth::GithubCopilotDeviceCode>()
+            .typ::<github_copilot_oauth::GithubCopilotPollStatus>()
+            .typ::<github_copilot_oauth::GithubCopilotTokenInfo>()
+            .typ::<github_copilot_proxy::ProxyInfo>()
             .typ::<oauth::OAuthStatus>();
 
         // Export to a temp file first, then only overwrite if content changed.
@@ -1081,6 +1096,14 @@ async fn main() {
             chatgpt_oauth::chatgpt_oauth_get_token,
             chatgpt_oauth::chatgpt_oauth_logout,
             chatgpt_oauth::chatgpt_oauth_models,
+            // GitHub Copilot OAuth (device flow) commands
+            github_copilot_oauth::github_copilot_oauth_start,
+            github_copilot_oauth::github_copilot_oauth_status,
+            github_copilot_oauth::github_copilot_oauth_get_token,
+            github_copilot_oauth::github_copilot_oauth_models,
+            github_copilot_oauth::github_copilot_chat_test,
+            github_copilot_oauth::github_copilot_oauth_logout,
+            github_copilot_proxy::github_copilot_proxy_info,
             // Generic OAuth commands (works for any OAuth integration)
             oauth::oauth_connect,
             oauth::oauth_cancel,
@@ -1143,6 +1166,16 @@ async fn main() {
                 app.deep_link().register_all()?;
             }
             let app_handle = app.handle();
+
+            // Eagerly start the GitHub Copilot proxy so its base_url + api_key
+            // are persisted to ~/.screenpipe/copilot-proxy.json before any
+            // pipe with a github-copilot preset starts. The pipe runner in
+            // screenpipe-core reads that file to dispatch through the proxy.
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = github_copilot_proxy::ensure_started().await {
+                    tracing::warn!("github copilot proxy eager start failed: {}", e);
+                }
+            });
 
             // Create macOS app menu with Settings
             #[cfg(target_os = "macos")]
@@ -1818,6 +1851,15 @@ async fn main() {
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = start_health_check(app_handle_clone).await {
                     error!("Failed to start health check service: {}", e);
+                }
+            });
+
+            // Start GitHub Copilot proxy lazily-but-eagerly: bind a loopback
+            // listener now so Pi's models.json (and any other client) can
+            // reach a stable URL without race. Idempotent.
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = github_copilot_proxy::ensure_started().await {
+                    warn!("github copilot proxy failed to start: {}", e);
                 }
             });
 

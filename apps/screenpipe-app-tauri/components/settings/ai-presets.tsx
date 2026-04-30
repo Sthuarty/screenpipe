@@ -5,6 +5,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { Button } from "../ui/button";
 import {
@@ -151,7 +152,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud";
+  type: "openai" | "openai-chatgpt" | "github-copilot" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud";
   title: string;
   description: string;
   imageSrc: string;
@@ -260,6 +261,10 @@ const AISection = ({
   const diagnosticsAbortRef = useRef<AbortController | null>(null);
   const [chatgptLoggedIn, setChatgptLoggedIn] = useState(false);
   const [chatgptLoading, setChatgptLoading] = useState(false);
+  const [githubLoggedIn, setGithubLoggedIn] = useState(false);
+  const [githubLoading, setGithubLoading] = useState(false);
+  const [githubDeviceCode, setGithubDeviceCode] = useState<{ user_code: string; verification_uri: string } | null>(null);
+  const [githubError, setGithubError] = useState<string | null>(null);
 
   // Filter presets the same way the UI does so hidden presets don't block creation
   const visiblePresets = useMemo(
@@ -322,6 +327,43 @@ const AISection = ({
       });
     }
   }, [settingsPreset?.provider]);
+
+  // Check GitHub Copilot OAuth status when provider is selected
+  useEffect(() => {
+    if (settingsPreset?.provider === "github-copilot") {
+      commands.githubCopilotOauthStatus().then((res) => {
+        if (res.status === "ok") {
+          setGithubLoggedIn(res.data.logged_in);
+        }
+      });
+    }
+  }, [settingsPreset?.provider]);
+
+  // Subscribe to GitHub Copilot device-flow polling events
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    tauriListen<{ kind: "pending" | "success" | "error"; message?: string }>(
+      "github-copilot-oauth-status",
+      (event) => {
+        const payload = event.payload;
+        if (payload.kind === "success") {
+          setGithubLoggedIn(true);
+          setGithubLoading(false);
+          setGithubDeviceCode(null);
+          setGithubError(null);
+        } else if (payload.kind === "error") {
+          setGithubLoading(false);
+          setGithubDeviceCode(null);
+          setGithubError(payload.message || "GitHub authorization failed");
+        }
+      }
+    ).then((un) => {
+      unlisten = un;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
 
 
   const isFormValid = useMemo(() => {
@@ -511,6 +553,10 @@ const AISection = ({
         newUrl = "https://api.openai.com/v1";
         newModel = "gpt-5.4";
         break;
+      case "github-copilot":
+        newUrl = "";
+        newModel = settingsPreset?.model || "gpt-4o";
+        break;
       case "anthropic":
         newUrl = "";
         newModel = "claude-sonnet-4-6";
@@ -543,6 +589,7 @@ const AISection = ({
     const abort = new AbortController();
     diagnosticsAbortRef.current = abort;
     const isChatGpt = settingsPreset?.provider === "openai-chatgpt";
+    const isGithubCopilot = settingsPreset?.provider === "github-copilot";
 
     setTestStatus("testing");
     setTestResults(INITIAL_DIAGNOSTICS);
@@ -563,6 +610,71 @@ const AISection = ({
       }));
       setTestStatus("done");
     };
+
+    // GitHub Copilot: all steps go through the Rust broker (handles auth headers + Copilot session token).
+    if (isGithubCopilot) {
+      setTestResults((prev) => ({
+        ...prev,
+        endpoint: { status: "running", message: "Connecting..." },
+      }));
+
+      const tokenRes = await commands.githubCopilotOauthGetToken();
+      if (tokenRes.status !== "ok") {
+        skipRemaining(
+          "auth",
+          tokenRes.error?.includes("Copilot subscription")
+            ? "GitHub account does not have an active Copilot subscription."
+            : `Could not get Copilot token: ${tokenRes.error}`
+        );
+        return;
+      }
+      if (abort.signal.aborted) return;
+      setTestResults((prev) => ({
+        ...prev,
+        endpoint: { status: "pass", message: tokenRes.data.api_endpoint },
+        auth: { status: "pass", message: "Copilot session token obtained" },
+        models: { status: "running", message: "Loading..." },
+      }));
+
+      const modelsRes = await commands.githubCopilotOauthModels();
+      if (modelsRes.status !== "ok") {
+        skipRemaining("models", `Models fetch failed: ${modelsRes.error}`);
+        return;
+      }
+      if (abort.signal.aborted) return;
+      const ghModels = modelsRes.data.map((id) => ({
+        id,
+        name: id,
+        provider: "github-copilot",
+      }));
+      setModels(ghModels);
+      setTestResults((prev) => ({
+        ...prev,
+        models: { status: "pass", message: `${ghModels.length} model${ghModels.length !== 1 ? "s" : ""} loaded` },
+        chat: { status: "running", message: "Sending test message..." },
+      }));
+
+      const chatStart = performance.now();
+      const body = buildChatTestBody(settingsPreset?.model || "gpt-4o", "say hi", 50, "max_tokens");
+      const chatRes = await commands.githubCopilotChatTest(settingsPreset?.model || "gpt-4o", body as any);
+      const latencyMs = Math.round(performance.now() - chatStart);
+      if (abort.signal.aborted) return;
+      if (chatRes.status !== "ok") {
+        setTestResults((prev) => ({
+          ...prev,
+          chat: { status: "fail", message: `${chatRes.error}`.slice(0, 160), latencyMs },
+        }));
+        setTestStatus("done");
+        return;
+      }
+      const reply: string = (chatRes.data as any)?.choices?.[0]?.message?.content?.toString().slice(0, 100) || "No response";
+      setTestResults((prev) => ({
+        ...prev,
+        chat: { status: "pass", message: `OK (${latencyMs}ms): "${reply}"`, latencyMs },
+      }));
+      setTestStatus("done");
+      return;
+    }
 
     // Determine models URL
     const isAnthropic = settingsPreset?.provider === "anthropic";
@@ -842,6 +954,7 @@ const AISection = ({
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
+    settingsPreset?.provider !== "github-copilot" &&
     settingsPreset?.provider !== "anthropic" &&
     settingsPreset?.url !== "https://api.screenpi.pe/v1" &&
     settingsPreset?.url !== "http://localhost:11434/v1" &&
@@ -1013,6 +1126,23 @@ const AISection = ({
           break;
         }
 
+        case "github-copilot": {
+          const res = await commands.githubCopilotOauthModels();
+          if (res.status === "ok") {
+            // Copilot's /models can return duplicate ids (different policies /
+            // capability tiers under the same surface name). Dedupe so React
+            // keys stay unique.
+            const uniq = Array.from(new Set(res.data));
+            setModels(
+              uniq.map((id) => ({ id, name: id, provider: "github-copilot" }))
+            );
+          } else {
+            console.warn("[github-copilot] models fetch failed:", res.error);
+            setModels([]);
+          }
+          break;
+        }
+
         case "screenpipe-cloud": {
           // Fetch models from gateway so new models appear automatically
           try {
@@ -1070,7 +1200,7 @@ const AISection = ({
       setIsLoadingModels(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settings.user?.id, chatgptLoggedIn]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settings.user?.id, chatgptLoggedIn, githubLoggedIn]);
 
   const apiKey = useMemo(() => {
     if (settingsPreset && "apiKey" in settingsPreset) {
@@ -1100,13 +1230,13 @@ const AISection = ({
       settingsPreset.provider === "openai" || settingsPreset.provider === "anthropic" || settingsPreset.provider === "custom";
     if (needsApiKey && !settingsPreset.apiKey) return;
 
-    if (settingsPreset.provider === "openai-chatgpt" || settingsPreset.provider === "native-ollama" || settingsPreset.url) {
+    if (settingsPreset.provider === "openai-chatgpt" || settingsPreset.provider === "github-copilot" || settingsPreset.provider === "native-ollama" || settingsPreset.url) {
       const timer = setTimeout(() => {
         runDiagnostics();
       }, 1000);
       return () => clearTimeout(timer);
     }
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, runDiagnostics, chatgptLoggedIn]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, runDiagnostics, chatgptLoggedIn, githubLoggedIn]);
 
   // Cleanup abort controller on unmount
   useEffect(() => {
@@ -1144,6 +1274,15 @@ const AISection = ({
             imageSrc="/images/openai.png"
             selected={settingsPreset?.provider === "openai-chatgpt"}
             onClick={() => handleAiProviderChange("openai-chatgpt")}
+          />
+
+          <AIProviderCard
+            type="github-copilot"
+            title="GitHub Copilot"
+            description="Sign in with your GitHub Copilot Pro/Pro+ subscription"
+            imageSrc="/images/github.png"
+            selected={settingsPreset?.provider === "github-copilot"}
+            onClick={() => handleAiProviderChange("github-copilot")}
           />
 
           <AIProviderCard
@@ -1312,6 +1451,113 @@ const AISection = ({
                 <span className="text-sm text-muted-foreground">Signed in</span>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {settingsPreset?.provider === "github-copilot" && (
+        <div className="w-full">
+          <div className="flex flex-col gap-4 mb-4 w-full">
+            <Label className="flex items-center gap-1">
+              GitHub Account
+            </Label>
+            <div className="flex items-center gap-3 flex-wrap">
+              <Button
+                type="button"
+                variant={githubLoggedIn ? "outline" : "default"}
+                disabled={githubLoading}
+                onClick={async () => {
+                  if (githubLoggedIn) {
+                    setGithubLoading(true);
+                    await commands.githubCopilotOauthLogout();
+                    setGithubLoggedIn(false);
+                    setGithubLoading(false);
+                    return;
+                  }
+                  setGithubLoading(true);
+                  setGithubError(null);
+                  const res = await commands.githubCopilotOauthStart();
+                  if (res.status === "ok") {
+                    setGithubDeviceCode({
+                      user_code: res.data.user_code,
+                      verification_uri: res.data.verification_uri,
+                    });
+                    // Auto-open verification URL in browser
+                    try {
+                      await openUrl(res.data.verification_uri);
+                    } catch (e) {
+                      console.warn("failed to open verification url:", e);
+                    }
+                    // Loading stays true until success/error event arrives.
+                  } else {
+                    setGithubError(res.error || "failed to start device flow");
+                    setGithubLoading(false);
+                  }
+                }}
+              >
+                {githubLoading && !githubDeviceCode ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : githubLoggedIn ? (
+                  <CheckCircle2 className="h-4 w-4 mr-2" />
+                ) : null}
+                {githubLoggedIn ? "Sign out" : "Sign in with GitHub"}
+              </Button>
+              {githubLoggedIn && (
+                <span className="text-sm text-muted-foreground">Signed in</span>
+              )}
+            </div>
+            {githubDeviceCode && !githubLoggedIn && (
+              <div className="rounded-md border bg-muted/40 p-4 flex flex-col gap-3">
+                <div className="flex items-center gap-2 text-sm">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Waiting for GitHub authorization…
+                </div>
+                <div className="text-sm">
+                  1. Open{" "}
+                  <button
+                    type="button"
+                    className="underline underline-offset-2 hover:text-foreground"
+                    onClick={() => openUrl(githubDeviceCode.verification_uri)}
+                  >
+                    {githubDeviceCode.verification_uri}
+                  </button>
+                </div>
+                <div className="text-sm flex items-center gap-2">
+                  2. Enter this code:
+                  <code className="px-2 py-1 rounded bg-background border font-mono tracking-widest text-base">
+                    {githubDeviceCode.user_code}
+                  </code>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => navigator.clipboard.writeText(githubDeviceCode.user_code)}
+                  >
+                    <Copy className="h-3 w-3 mr-1" /> Copy
+                  </Button>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="w-fit"
+                  onClick={() => {
+                    setGithubDeviceCode(null);
+                    setGithubLoading(false);
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            )}
+            {githubError && (
+              <div className="text-sm text-destructive flex items-center gap-2">
+                <AlertCircle className="h-4 w-4" /> {githubError}
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground">
+              Uses GitHub’s unofficial Copilot API. May break if GitHub changes their service.
+            </p>
           </div>
         </div>
       )}
@@ -1717,6 +1963,7 @@ const AISection = ({
 const providerImageSrc: Record<string, string> = {
   openai: "/images/openai.png",
   "openai-chatgpt": "/images/openai.png",
+  "github-copilot": "/images/github.png",
   anthropic: "/images/claude-ai.svg",
   "native-ollama": "/images/ollama.png",
   custom: "/images/custom.png",

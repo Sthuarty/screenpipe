@@ -546,6 +546,8 @@ pub enum AIProviderType {
     OpenAI,
     #[serde(rename = "openai-chatgpt")]
     OpenAIChatGPT,
+    #[serde(rename = "github-copilot")]
+    GitHubCopilot,
     #[serde(rename = "native-ollama")]
     NativeOllama,
     #[serde(rename = "custom")]
@@ -855,6 +857,7 @@ impl SettingsStore {
             let known_providers = [
                 "openai",
                 "openai-chatgpt",
+                "github-copilot",
                 "native-ollama",
                 "custom",
                 "screenpipe-cloud",

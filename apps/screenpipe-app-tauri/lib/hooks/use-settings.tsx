@@ -18,6 +18,7 @@ export type AIProviderType =
 	| "native-ollama"
 	| "openai"
 	| "openai-chatgpt"
+	| "github-copilot"
 	| "anthropic"
 	| "custom"
 	| "embedded"
@@ -68,6 +69,9 @@ export type AIPreset = {
 	  }
 	| {
 			provider: "openai-chatgpt";
+	  }
+	| {
+			provider: "github-copilot";
 	  }
 );
 
